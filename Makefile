@@ -21,6 +21,13 @@ build_lastz_32:
 build_lastz_40:
 	cd src && ${MAKE} lastz_40
 
+# Stage-timer-instrumented variant. Built side-by-side with the un-instrumented
+# `lastz`. Prints a per-stage timing report on completion (to stderr by default;
+# set the LASTZ_STAGE_REPORT env var to redirect to a file).
+build_lastz_timed:
+	cd src && ${MAKE} lastz_T
+lastz_T: build_lastz_timed
+
 build_test_version:
 	cd src && ${MAKE} lastz-test lastz_D-test
 

@@ -282,7 +282,7 @@ s64 dbgTargetProgressClock = 0;
 #define dbg_timing_sub(v) ;
 #define dbg_timing_add(v) ;
 #define dbg_timing_copy(dst,src) ;
-#define dbg_timing_report(v,s) ;
+#define dbg_timing_report(f,v,s) ;
 #endif // not dbgTiming
 
 #ifdef dbgTiming
@@ -302,7 +302,11 @@ s64 debugClockTotal = 0,
 #define dbg_timing_add(v)  { v += (s64) read_clock();  }
 #define dbg_timing_copy(dst,src) { dst = src; }
 
-#define dbg_timing_report(v,s) { fprintf(stderr,"%-26s %.3f\n",s":",((float)(v))/clocksPerSec); }
+// dbg_timing_report writes one timing line to FILE* f. f is selected at the
+// report site (either stderr or, if LASTZ_STAGE_REPORT is set in the env, the
+// file at that path). Format and contents are unchanged from the original
+// stderr-only version.
+#define dbg_timing_report(f,v,s) { fprintf((f),"%-26s %.3f\n",s":",((float)(v))/clocksPerSec); }
 #endif // dbgTiming
 
 //----------
@@ -2008,41 +2012,68 @@ show_stats_and_clean_up:
 	dbg_timing_add (debugClockTotal);
 	dbg_timing_add (debugClockQueryTotal);
 
-	dbg_timing_report (debugClockTotal,         "total run time");
-	dbg_timing_report (debugClockSeq1,          "sequence 1 I/O");
-	dbg_timing_report (debugClockPosTable,      "seed position table");
-	dbg_timing_report (debugClockSeq2,          "sequence 2 I/O");
-	dbg_timing_report (debugClockSegTable,      "seed hit search");
-	dbg_timing_report (debugClockChaining,      "chaining");
-	dbg_timing_report (debugClockGappedExtend,  "gapped extension");
-	dbg_timing_report (debugClockInterpolation, "interpolation");
-	dbg_timing_report (debugClockOutput,        "output");
-	dbg_timing_report (debugClockQueryTotal,    "total query time");
-
 #ifdef dbgTiming
+	{
+	// Choose where the stage-timing report goes:
+	//   - if LASTZ_STAGE_REPORT is set and openable for writing, send the
+	//     report to that file (so harnesses can capture it cleanly without
+	//     scraping the rest of lastz's stderr);
+	//   - otherwise, fall back to stderr (preserves the original behavior).
+	// The block is bracketed by ===STAGE_TIMING_BEGIN=== / ===STAGE_TIMING_END===
+	// markers so a parser can locate it deterministically inside stderr too.
+	FILE* stageF        = stderr;
+	const char* stagePath = getenv ("LASTZ_STAGE_REPORT");
+	int stageOwnsFile   = 0;
+	if ((stagePath != NULL) && (stagePath[0] != 0))
+		{
+		FILE* f = fopen (stagePath, "w");
+		if (f != NULL) { stageF = f;  stageOwnsFile = 1; }
+		else fprintf (stderr,
+		              "warning: could not open LASTZ_STAGE_REPORT=%s for writing;"
+		              " falling back to stderr\n", stagePath);
+		}
+
+	fprintf (stageF, "===STAGE_TIMING_BEGIN===\n");
+
+	dbg_timing_report (stageF, debugClockTotal,         "total run time");
+	dbg_timing_report (stageF, debugClockSeq1,          "sequence 1 I/O");
+	dbg_timing_report (stageF, debugClockPosTable,      "seed position table");
+	dbg_timing_report (stageF, debugClockSeq2,          "sequence 2 I/O");
+	dbg_timing_report (stageF, debugClockSegTable,      "seed hit search");
+	dbg_timing_report (stageF, debugClockChaining,      "chaining");
+	dbg_timing_report (stageF, debugClockGappedExtend,  "gapped extension");
+	dbg_timing_report (stageF, debugClockInterpolation, "interpolation");
+	dbg_timing_report (stageF, debugClockOutput,        "output");
+	dbg_timing_report (stageF, debugClockQueryTotal,    "total query time");
+
 	{
 	float perQuery;
 
 	perQuery =  ((float) debugClockQueryTotal) / numChores;
 	perQuery /= clocksPerSec;
 
-	fprintf (stderr, "%-26s %d\n",
+	fprintf (stageF, "%-26s %d\n",
 	                 "queries:", numChores);
-	fprintf (stderr, "%-26s %.3f (%.1f per second)\n",
+	fprintf (stageF, "%-26s %.3f (%.1f per second)\n",
 	                 "per query (with I/O):", perQuery, 1/perQuery);
 
 	debugClockQueryTotal -= debugClockSeq2;
 	perQuery =  ((float) debugClockQueryTotal) / numChores;
 	perQuery /= clocksPerSec;
 
-	fprintf (stderr, "%-26s %.3f (%.1f per second)\n",
+	fprintf (stageF, "%-26s %.3f (%.1f per second)\n",
 	                 "per query (w/o input):", perQuery, 1/perQuery);
 	}
-#endif // dbgTiming
 
 #ifdef dbgTimingGappedExtend
-	gapped_extend_timing_report (stderr);
+	gapped_extend_timing_report (stageF);
 #endif // dbgTimingGappedExtend
+
+	fprintf (stageF, "===STAGE_TIMING_END===\n");
+	fflush (stageF);
+	if (stageOwnsFile) fclose (stageF);
+	}
+#endif // dbgTiming
 
 	if (dbgReportFinish)
 		fprintf (stderr, "lastz has finished successfully\n");

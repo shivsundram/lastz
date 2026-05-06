@@ -64,6 +64,18 @@ ifeq ($(allowBackToBackGaps), ON)              # .. is off;  see note above for
 	definedForAll += -DallowBackToBackGaps     # .. how to turn it on
 endif
 
+# When stageTimers=ON, build with the existing dbgTiming infrastructure
+# so the program prints a per-stage timing report on completion. This is a
+# zero-cost-when-off accumulator-style instrumentation already present in
+# lastz.c and gapped_extend.c. When enabled, lastz also looks for the
+# LASTZ_STAGE_REPORT environment variable; if set, the timing report goes
+# to that file instead of stderr (so benchmarking harnesses can capture it
+# cleanly).
+stageTimers ?= 0
+ifeq ($(stageTimers), ON)
+	definedForAll += -DdbgTiming -DdbgTimingGappedExtend
+endif
+
 
 VERSION_FLAGS= \
 	-DVERSION_MAJOR="\"${VERSION_MAJOR}"\" \
@@ -104,6 +116,11 @@ incFiles = lastz.h infer_scores.h \
 %_40.o: %.c version.mak ${incFiles}
 	${CC} -c ${CFLAGS} ${flagsFor40} $< -o $@
 
+# Stage-timer-instrumented objects (force dbgTiming on regardless of the
+# stageTimers knob; this lets `lastz_T` be built side-by-side with `lastz`).
+%_T.o: %.c version.mak ${incFiles}
+	${CC} -c ${CFLAGS} -DdbgTiming -DdbgTimingGappedExtend -Dscore_type=I $< -o $@
+
 
 lastz: $(foreach part,${srcFiles},${part}.o)
 	${CC} $(foreach part,${srcFiles},${part}.o) -lm -o $@
@@ -117,6 +134,9 @@ lastz_32: $(foreach part,${srcFiles},${part}_32.o)
 lastz_40: $(foreach part,${srcFiles},${part}_40.o)
 	${CC} $(foreach part,${srcFiles},${part}_40.o) -lm -o $@
 
+lastz_T: $(foreach part,${srcFiles},${part}_T.o)
+	${CC} $(foreach part,${srcFiles},${part}_T.o) -lm -o $@
+
 # cleanup
 
 clean: cleano clean_builds clean_tests
@@ -129,6 +149,7 @@ clean_builds:
 	rm -f lastz_D
 	rm -f lastz_32
 	rm -f lastz_40
+	rm -f lastz_T
 
 # installation;  change installDir to suit your needs (in ../make-include.mak)
 
