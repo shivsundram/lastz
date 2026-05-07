@@ -287,5 +287,11 @@ float  discovery_probability  (seq* seq1, unspos pos1,
                                seq* seq2, unspos pos2, unspos length,
                                seed* hitSeed, u32 step);
 
+#ifdef dbgTimingSubstages
+// Print rdtsc-based substage breakdown to f.  Defined in seed_search.c when
+// built with -DdbgTimingSubstages; otherwise the call site is #ifdef'd out.
+void   seed_search_substage_report (FILE* f);
+#endif
+
 #undef global
 #endif // seed_search_H

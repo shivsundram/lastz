@@ -33,6 +33,105 @@
 #define  seed_search_owner		// (make this the owner of its globals)
 #include "seed_search.h"		// interface to this module
 
+//----------
+//
+// rdtsc-based substage instrumentation (build with -DdbgTimingSubstages).
+//
+// Goal: decompose the seed_hit_search wall budget into sub-cycles so we can
+// tell whether find_table_matches's chain walk is memory-latency-bound vs.
+// the dispatch into process_for_simple_hit, and whether the time inside
+// process_for_simple_hit is spent in the diagonal-dedup short-circuit, in
+// xdrop_extend_seed_hit, or in the HSP-emit reporter callback.
+//
+// Each timer is a u64 cycle accumulator; rdtsc is ~25 cycles on modern x86,
+// so the minimum work block we time should be at least an order of magnitude
+// larger to keep overhead below ~5%.
+//
+//----------
+
+#ifdef dbgTimingSubstages
+#include <x86intrin.h>           // __rdtsc()
+
+// find_table_matches loop instrumentation: total cycles in the chain walk
+// loop body excluding the processor callback, total cycles inside the
+// processor callback, and a count of loop iterations (= number of seed
+// hits handed to the processor).
+static u64 rdtsc_ftm_calls            = 0;  // calls to find_table_matches
+static u64 rdtsc_ftm_chain_iters      = 0;  // total chain links visited
+static u64 rdtsc_ftm_chain_walk_cyc   = 0;  // cycles in loop body (sans callee)
+static u64 rdtsc_ftm_processor_cyc    = 0;  // cycles inside (*processor)(...)
+
+// process_for_simple_hit instrumentation: dedup short-circuit vs. full path
+// (xdrop + reporter), with separate cycle accumulators per branch.
+static u64 rdtsc_pfs_calls            = 0;  // total calls
+static u64 rdtsc_pfs_dedup_skip       = 0;  // calls that returned via dedup
+static u64 rdtsc_pfs_dedup_skip_cyc   = 0;  //   cycles in dedup-skip path
+static u64 rdtsc_xdrop_calls          = 0;  // calls to xdrop_extend_seed_hit
+static u64 rdtsc_xdrop_no_score       = 0;  //   xdrop calls that returned noScore
+static u64 rdtsc_xdrop_cyc            = 0;  // cycles inside xdrop_extend_seed_hit
+static u64 rdtsc_reporter_calls       = 0;  // calls to (*info->hp.reporter)(...)
+static u64 rdtsc_reporter_cyc         = 0;  // cycles inside reporter callback
+
+void seed_search_substage_report (FILE* f)
+	{
+	fprintf (f, "--- rdtsc substage breakdown ---\n");
+	fprintf (f, "%-32s %20s %20s %16s\n",
+	         "substage", "total_cycles", "calls/iters", "cyc/call");
+
+	// find_table_matches breakdown
+	double cw_per_iter = (rdtsc_ftm_chain_iters == 0) ? 0.0
+	                   : (double) rdtsc_ftm_chain_walk_cyc / (double) rdtsc_ftm_chain_iters;
+	double pr_per_iter = (rdtsc_ftm_chain_iters == 0) ? 0.0
+	                   : (double) rdtsc_ftm_processor_cyc  / (double) rdtsc_ftm_chain_iters;
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "ftm.chain_walk",
+	         (unsigned long long) rdtsc_ftm_chain_walk_cyc,
+	         (unsigned long long) rdtsc_ftm_chain_iters, cw_per_iter);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "ftm.processor_callback",
+	         (unsigned long long) rdtsc_ftm_processor_cyc,
+	         (unsigned long long) rdtsc_ftm_chain_iters, pr_per_iter);
+	fprintf (f, "%-32s %20llu %20llu %16s\n",
+	         "ftm.calls",
+	         0ULL, (unsigned long long) rdtsc_ftm_calls, "-");
+
+	// process_for_simple_hit breakdown
+	double dedup_per_call = (rdtsc_pfs_dedup_skip == 0) ? 0.0
+	                      : (double) rdtsc_pfs_dedup_skip_cyc / (double) rdtsc_pfs_dedup_skip;
+	double xd_per_call    = (rdtsc_xdrop_calls == 0) ? 0.0
+	                      : (double) rdtsc_xdrop_cyc / (double) rdtsc_xdrop_calls;
+	double rep_per_call   = (rdtsc_reporter_calls == 0) ? 0.0
+	                      : (double) rdtsc_reporter_cyc / (double) rdtsc_reporter_calls;
+	fprintf (f, "%-32s %20llu %20llu %16s\n",
+	         "pfs.calls_total",
+	         0ULL, (unsigned long long) rdtsc_pfs_calls, "-");
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "pfs.dedup_short_circuit",
+	         (unsigned long long) rdtsc_pfs_dedup_skip_cyc,
+	         (unsigned long long) rdtsc_pfs_dedup_skip, dedup_per_call);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "xdrop_extend_seed_hit",
+	         (unsigned long long) rdtsc_xdrop_cyc,
+	         (unsigned long long) rdtsc_xdrop_calls, xd_per_call);
+	fprintf (f, "%-32s %20llu %20llu %16s\n",
+	         "  └─ xdrop.no_score_returns",
+	         0ULL, (unsigned long long) rdtsc_xdrop_no_score, "-");
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "reporter_callback",
+	         (unsigned long long) rdtsc_reporter_cyc,
+	         (unsigned long long) rdtsc_reporter_calls, rep_per_call);
+
+	// Reconciliation hint: ftm.processor_cyc should ≈ sum of pfs paths.
+	u64 pfs_total_cyc = rdtsc_pfs_dedup_skip_cyc + rdtsc_xdrop_cyc + rdtsc_reporter_cyc;
+	if (pfs_total_cyc > 0)
+		fprintf (f, "# pfs subtree total: %llu cyc  (vs ftm.processor_cyc: %llu, "
+		            "delta = %lld due to pfs body itself + dispatch)\n",
+		         (unsigned long long) pfs_total_cyc,
+		         (unsigned long long) rdtsc_ftm_processor_cyc,
+		         (long long) ((s64) rdtsc_ftm_processor_cyc - (s64) pfs_total_cyc));
+	}
+#endif // dbgTimingSubstages
+
 // debugging defines
 
 //#define debugDiag 97-60724168	// if defined, breakdown what happens with
@@ -816,6 +915,11 @@ static u64 find_table_matches
 	u32		step     = pt->step;
 	unspos	pos, pos1;
 	u64		basesHit = 0;
+#ifdef dbgTimingSubstages
+	u64		t_loop_start, t_loop_end, t_proc_total = 0;
+	u64		chain_iters = 0;
+	rdtsc_ftm_calls += 1;
+#endif
 
 	seedLength = (unsigned) hitSeed->length;
 	len1       = seedLength-1;
@@ -829,8 +933,14 @@ static u64 find_table_matches
 		return 0;
 		}
 
+#ifdef dbgTimingSubstages
+	t_loop_start = __rdtsc();
+#endif
 	for (pos=pt->last[packed2] ; pos!=noPreviousPos ; pos=pt->prev[pos])
 		{
+#ifdef dbgTimingSubstages
+		chain_iters += 1;
+#endif
 		pos1 = adjStart + step*pos;
 
 #ifdef debugSearchPos2
@@ -863,13 +973,35 @@ static u64 find_table_matches
 		// call the seed hit processor for this seed hit
 
 		seed_search_count_stat (rawSeedHits);
+#ifdef dbgTimingSubstages
+		{
+		u64 t_proc_in = __rdtsc();
 		basesHit += (*processor) (processorInfo, pos1, pos2, seedLength);
+		t_proc_total += __rdtsc() - t_proc_in;
+		}
+#else
+		basesHit += (*processor) (processorInfo, pos1, pos2, seedLength);
+#endif
 
 #ifdef densityCheckDepth3
 		if ((maxBasesAllowed > 0) && (basesHit > maxBasesAllowed))
+			{
+#ifdef dbgTimingSubstages
+			t_loop_end = __rdtsc();
+			rdtsc_ftm_chain_walk_cyc += (t_loop_end - t_loop_start) - t_proc_total;
+			rdtsc_ftm_processor_cyc  += t_proc_total;
+			rdtsc_ftm_chain_iters    += chain_iters;
+#endif
 			return basesHit;
+			}
 #endif // densityCheckDepth3
 		}
+#ifdef dbgTimingSubstages
+	t_loop_end = __rdtsc();
+	rdtsc_ftm_chain_walk_cyc += (t_loop_end - t_loop_start) - t_proc_total;
+	rdtsc_ftm_processor_cyc  += t_proc_total;
+	rdtsc_ftm_chain_iters    += chain_iters;
+#endif
 
 	return basesHit;
 	}
@@ -1066,6 +1198,10 @@ u64 process_for_simple_hit
 #ifdef snoopDiagHash
 	unspos	start2 = pos2 - length;
 #endif // snoopDiagHash
+#ifdef dbgTimingSubstages
+	u64		t_pfs_entry = __rdtsc();
+	rdtsc_pfs_calls += 1;
+#endif
 
 	// filter by position (if specified)
 
@@ -1122,6 +1258,10 @@ u64 process_for_simple_hit
 		                 hDiag, diagEnd[hDiag],
 		                 pos1, pos2, start2, pos2);
 #endif // snoopDiagHash
+#ifdef dbgTimingSubstages
+		rdtsc_pfs_dedup_skip_cyc += __rdtsc() - t_pfs_entry;
+		rdtsc_pfs_dedup_skip     += 1;
+#endif
 		return 0;
 		}
 
@@ -1153,9 +1293,19 @@ u64 process_for_simple_hit
 		}
 	else if (info->hp.gfExtend == gfexXDrop)
 		{
+#ifdef dbgTimingSubstages
+		{
+		u64 t_xd_in = __rdtsc();
+		s = xdrop_extend_seed_hit (&info->hp, &pos1, &pos2, &length);
+		rdtsc_xdrop_cyc   += __rdtsc() - t_xd_in;
+		rdtsc_xdrop_calls += 1;
+		if (s == noScore) { rdtsc_xdrop_no_score += 1; return 0; }
+		}
+#else
 		s = xdrop_extend_seed_hit (&info->hp, &pos1, &pos2, &length);
 		if (s == noScore)
 			return 0;
+#endif
 		}
 	else if ((info->hp.gfExtend >= gfexMismatch_min)
 	      && (info->hp.gfExtend <= gfexMismatch_max))
@@ -1186,7 +1336,16 @@ u64 process_for_simple_hit
 	fprintf (stderr, "process_for_simple_hit reporting " unsposSlashFmt " #" unsposFmt " (to %p)\n",
 	                 pos1, pos2, length, info->hp.reporter);
 #endif
+#ifdef dbgTimingSubstages
+	{
+	u64 t_rep_in = __rdtsc();
 	basesHit = ((*info->hp.reporter) (info->hp.reporterInfo, pos1, pos2, length, s));
+	rdtsc_reporter_cyc   += __rdtsc() - t_rep_in;
+	rdtsc_reporter_calls += 1;
+	}
+#else
+	basesHit = ((*info->hp.reporter) (info->hp.reporterInfo, pos1, pos2, length, s));
+#endif
 	if (basesHit > 0) searchToGo--;
 	return basesHit;
 	}

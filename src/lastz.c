@@ -2069,6 +2069,10 @@ show_stats_and_clean_up:
 	gapped_extend_timing_report (stageF);
 #endif // dbgTimingGappedExtend
 
+#ifdef dbgTimingSubstages
+	seed_search_substage_report (stageF);
+#endif // dbgTimingSubstages
+
 	fprintf (stageF, "===STAGE_TIMING_END===\n");
 	fflush (stageF);
 	if (stageOwnsFile) fclose (stageF);

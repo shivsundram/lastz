@@ -28,6 +28,15 @@ build_lastz_timed:
 	cd src && ${MAKE} lastz_T
 lastz_T: build_lastz_timed
 
+# Substage variant: same as lastz_T plus per-iteration rdtsc timers around the
+# seed_hit_search inner loop (chain walk vs. processor callback) and inside
+# process_for_simple_hit (dedup short-circuit vs. xdrop_extend_seed_hit vs.
+# HSP reporter). Adds a couple percent overhead via per-iteration rdtsc — use
+# lastz_T for absolute wall-time, lastz_TS for substage breakdown.
+build_lastz_substages:
+	cd src && ${MAKE} lastz_TS
+lastz_TS: build_lastz_substages
+
 build_test_version:
 	cd src && ${MAKE} lastz-test lastz_D-test
 

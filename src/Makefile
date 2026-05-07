@@ -124,6 +124,14 @@ incFiles = lastz.h infer_scores.h \
 %_T.o: %.c version.mak ${incFiles}
 	${CC} -c ${CFLAGS} -g -DdbgTiming -DdbgTimingGappedExtend -Dscore_type=I $< -o $@
 
+# Substage-instrumented objects: same as %_T.o plus -DdbgTimingSubstages, which
+# turns on rdtsc accumulators inside the seed_hit_search hot loop (chain walk,
+# diagonal dedup, x-drop extension, HSP reporter). Used by lastz_TS — built
+# side-by-side with lastz_T so we can A/B against it (substage timers add a
+# couple percent of overhead via per-iteration rdtsc).
+%_TS.o: %.c version.mak ${incFiles}
+	${CC} -c ${CFLAGS} -g -DdbgTiming -DdbgTimingGappedExtend -DdbgTimingSubstages -Dscore_type=I $< -o $@
+
 
 lastz: $(foreach part,${srcFiles},${part}.o)
 	${CC} $(foreach part,${srcFiles},${part}.o) -lm -o $@
@@ -140,6 +148,9 @@ lastz_40: $(foreach part,${srcFiles},${part}_40.o)
 lastz_T: $(foreach part,${srcFiles},${part}_T.o)
 	${CC} -g $(foreach part,${srcFiles},${part}_T.o) -lm -o $@
 
+lastz_TS: $(foreach part,${srcFiles},${part}_TS.o)
+	${CC} -g $(foreach part,${srcFiles},${part}_TS.o) -lm -o $@
+
 # cleanup
 
 clean: cleano clean_builds clean_tests
@@ -153,6 +164,7 @@ clean_builds:
 	rm -f lastz_32
 	rm -f lastz_40
 	rm -f lastz_T
+	rm -f lastz_TS
 
 # installation;  change installDir to suit your needs (in ../make-include.mak)
 
