@@ -118,8 +118,11 @@ incFiles = lastz.h infer_scores.h \
 
 # Stage-timer-instrumented objects (force dbgTiming on regardless of the
 # stageTimers knob; this lets `lastz_T` be built side-by-side with `lastz`).
+# We also tack on -g so eu-stack and other sampling profilers can resolve
+# file:line in addition to function names. -g is free at -O3 (stays in
+# .debug sections, not in .text).
 %_T.o: %.c version.mak ${incFiles}
-	${CC} -c ${CFLAGS} -DdbgTiming -DdbgTimingGappedExtend -Dscore_type=I $< -o $@
+	${CC} -c ${CFLAGS} -g -DdbgTiming -DdbgTimingGappedExtend -Dscore_type=I $< -o $@
 
 
 lastz: $(foreach part,${srcFiles},${part}.o)
@@ -135,7 +138,7 @@ lastz_40: $(foreach part,${srcFiles},${part}_40.o)
 	${CC} $(foreach part,${srcFiles},${part}_40.o) -lm -o $@
 
 lastz_T: $(foreach part,${srcFiles},${part}_T.o)
-	${CC} $(foreach part,${srcFiles},${part}_T.o) -lm -o $@
+	${CC} -g $(foreach part,${srcFiles},${part}_T.o) -lm -o $@
 
 # cleanup
 
