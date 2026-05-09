@@ -70,6 +70,102 @@
 #define  gapped_extend_owner	// (make this the owner of its globals)
 #include "gapped_extend.h"		// interface to this module
 
+//----------
+//
+// rdtsc-based substage instrumentation (build with -DdbgTimingSubstages).
+//
+// Goal: decompose ydrop_one_sided_align's wall budget into sub-cycles so we
+// can tell whether the bottleneck is the inner DP cell loop (per-cell cost,
+// memory bandwidth, branchy score updates), the per-row L/R bounds work,
+// the traceback walk, or per-call setup/cleanup. This directly shapes what
+// a GPU kernel would have to optimize: an inner-cell-bound regime wants a
+// systolic banded-DP kernel; a traceback-bound regime wants gather/scatter
+// over predicted edit scripts; a bounds-bound regime wants on-CPU dispatch.
+//
+// rdtsc is ~25 cycles on modern x86. The inner DP cell body is ~10-15
+// cycles; we therefore time the inner loop in aggregate per row (rdtsc
+// outside the col-loop only) and divide by the cell count after the fact,
+// rather than rdtsc per cell.
+//
+//----------
+
+#ifdef dbgTimingSubstages
+#include <x86intrin.h>           // __rdtsc()
+
+// per-call accumulators
+static u64 rdtsc_yda_calls           = 0;  // # ydrop_one_sided_align calls (post-trivial-bail)
+static u64 rdtsc_yda_setup_cyc       = 0;  // pre-row-loop init (scoring, L/R, first DP row)
+static u64 rdtsc_yda_cleanup_cyc     = 0;  // post-traceback (filter_active_segs + frees)
+
+// per-row accumulators (sum over all rows over all calls)
+static u64 rdtsc_yda_rows            = 0;  // # DP rows processed
+static u64 rdtsc_yda_bounds_cyc      = 0;  // update_LR_bounds + update_active_segs
+static u64 rdtsc_yda_trailing_cyc    = 0;  // post-inner-loop row trailing (RY adjust + prolongation)
+
+// inner DP cell loop accumulators (the hottest path)
+static u64 rdtsc_yda_inner_cells     = 0;  // total inner-loop iterations (== dpCellsVisited)
+static u64 rdtsc_yda_inner_cyc       = 0;  // total cycles in the inner DP cell loop
+
+// traceback accumulators
+static u64 rdtsc_yda_traceback_steps = 0;  // edit-script ops produced
+static u64 rdtsc_yda_traceback_cyc   = 0;  // cycles in the traceback walk
+
+void gapped_extend_substage_report (FILE* f)
+	{
+	fprintf (f, "--- rdtsc gapped_extend breakdown ---\n");
+	fprintf (f, "%-32s %20s %20s %16s\n",
+	         "substage", "total_cycles", "calls/iters", "cyc/call");
+
+	double setup_per    = (rdtsc_yda_calls == 0) ? 0.0
+	                    : (double) rdtsc_yda_setup_cyc / (double) rdtsc_yda_calls;
+	double cleanup_per  = (rdtsc_yda_calls == 0) ? 0.0
+	                    : (double) rdtsc_yda_cleanup_cyc / (double) rdtsc_yda_calls;
+	double bounds_per   = (rdtsc_yda_rows == 0) ? 0.0
+	                    : (double) rdtsc_yda_bounds_cyc / (double) rdtsc_yda_rows;
+	double trailing_per = (rdtsc_yda_rows == 0) ? 0.0
+	                    : (double) rdtsc_yda_trailing_cyc / (double) rdtsc_yda_rows;
+	double inner_per    = (rdtsc_yda_inner_cells == 0) ? 0.0
+	                    : (double) rdtsc_yda_inner_cyc / (double) rdtsc_yda_inner_cells;
+	double trace_per    = (rdtsc_yda_traceback_steps == 0) ? 0.0
+	                    : (double) rdtsc_yda_traceback_cyc / (double) rdtsc_yda_traceback_steps;
+
+	fprintf (f, "%-32s %20s %20llu %16s\n",
+	         "yda.calls",
+	         "-", (unsigned long long) rdtsc_yda_calls, "-");
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.setup",
+	         (unsigned long long) rdtsc_yda_setup_cyc,
+	         (unsigned long long) rdtsc_yda_calls, setup_per);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.row_bounds",
+	         (unsigned long long) rdtsc_yda_bounds_cyc,
+	         (unsigned long long) rdtsc_yda_rows, bounds_per);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.inner_dp_cells",
+	         (unsigned long long) rdtsc_yda_inner_cyc,
+	         (unsigned long long) rdtsc_yda_inner_cells, inner_per);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.row_trailing",
+	         (unsigned long long) rdtsc_yda_trailing_cyc,
+	         (unsigned long long) rdtsc_yda_rows, trailing_per);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.traceback",
+	         (unsigned long long) rdtsc_yda_traceback_cyc,
+	         (unsigned long long) rdtsc_yda_traceback_steps, trace_per);
+	fprintf (f, "%-32s %20llu %20llu %16.1f\n",
+	         "yda.cleanup",
+	         (unsigned long long) rdtsc_yda_cleanup_cyc,
+	         (unsigned long long) rdtsc_yda_calls, cleanup_per);
+
+	u64 total = rdtsc_yda_setup_cyc + rdtsc_yda_bounds_cyc + rdtsc_yda_inner_cyc
+	          + rdtsc_yda_trailing_cyc + rdtsc_yda_traceback_cyc + rdtsc_yda_cleanup_cyc;
+	if (total > 0)
+		fprintf (f, "# total accounted: %llu cyc; inner_dp_cells share = %.1f%%\n",
+		         (unsigned long long) total,
+		         100.0 * (double) rdtsc_yda_inner_cyc / (double) total);
+	}
+#endif // dbgTimingSubstages
+
 // debugging defines
 
 //#define snoopAnchors			// if this is defined, extra code is added to
@@ -3476,6 +3572,11 @@ static score ydrop_one_sided_align
 	gapped_extend_count_stat (numExtensions);
 	dbg_timing_count_stat    (numExtensions);
 
+#ifdef dbgTimingSubstages
+	rdtsc_yda_calls += 1;
+	u64 t_setup_in = __rdtsc();
+#endif
+
 	snoopAlgorithm_1;
 
 	// extract scoring constants
@@ -3604,6 +3705,10 @@ static score ydrop_one_sided_align
 	boundaryScore = negInf;
 	endIsBoundary = false;
 
+#ifdef dbgTimingSubstages
+	{ u64 t_setup_out = __rdtsc(); rdtsc_yda_setup_cyc += t_setup_out - t_setup_in; }
+#endif
+
 	for (row=1; row<=M ; row++)
 		{
 #ifdef snoopAlgorithm
@@ -3621,11 +3726,19 @@ static score ydrop_one_sided_align
 		// update sweep row bounds, active segments, masking
 
 		prevLY = LY;
+#ifdef dbgTimingSubstages
+		u64 t_bounds_in = __rdtsc();
+#endif
 		update_LR_bounds   (reversed,
 		                    &rightSeg, &leftSeg, &rightAlign, &leftAlign,
 		                    row, anchor1, anchor2, &L, &R, &LY, &RY);
 		update_active_segs (reversed, &active, &alignList, dynProg->p-prevLY,
 		                    row, anchor1, anchor2, LY, RY);
+#ifdef dbgTimingSubstages
+		{ u64 t_bounds_out = __rdtsc();
+		  rdtsc_yda_bounds_cyc += t_bounds_out - t_bounds_in;
+		  rdtsc_yda_rows += 1; }
+#endif
 
 		snoopAlgorithm_4B;
 		snoopSubprobsB_2;
@@ -3680,6 +3793,9 @@ static score ydrop_one_sided_align
 		i = negInf;			// 'set' I[row][col]
 		c = negInf;			// propose C[row][col]
 
+#ifdef dbgTimingSubstages
+		u64 t_inner_in = __rdtsc();
+#endif
 		for ( ; (col<RY)&&((unspos)(b-B)<=N+1) ; col++)
 			{
 #ifdef snoopAlgorithm
@@ -3772,6 +3888,11 @@ static score ydrop_one_sided_align
 			snoopAlgorithm_6;
 			//snoopTraceback_1;
 			}
+#ifdef dbgTimingSubstages
+		{ u64 t_inner_out = __rdtsc();
+		  rdtsc_yda_inner_cyc   += t_inner_out - t_inner_in;
+		  rdtsc_yda_inner_cells += (col - leftCol); }
+#endif
 
 		gapped_extend_add_stat (dpCellsVisited, col-leftCol);
 
@@ -3783,6 +3904,9 @@ static score ydrop_one_sided_align
 		// finish up this row, by either moving the right bound left or
 		// prolonging the row to support an overhang on the row above
 
+#ifdef dbgTimingSubstages
+		u64 t_trailing_in = __rdtsc();
+#endif
 		snoopAlgorithm_7A;
 		NN = ((rightSeg != NULL) && (R > 0))? (R-1) : ((sgnpos) N);
 
@@ -3825,6 +3949,10 @@ static score ydrop_one_sided_align
 			RY++;							// .. and set C[row][col]
 			snoopAlgorithm_7E;
 			}
+#ifdef dbgTimingSubstages
+		{ u64 t_trailing_out = __rdtsc();
+		  rdtsc_yda_trailing_cyc += t_trailing_out - t_trailing_in; }
+#endif
 		}
 
 dp_finished:
@@ -3843,9 +3971,16 @@ dp_finished:
 		cTemp = 0;		// (place to set a breakpoint)
 #endif // snoopAlgorithm
 
+#ifdef dbgTimingSubstages
+	u64 t_trace_in = __rdtsc();
+	u64 trace_steps = 0;
+#endif
 	// ~~~ github issue 52 ~~~ need to check if this loop has overflow issues
 	for (prevOp=0 ; (row>=1) || (col>0) ; prevOp=op)
 		{
+#ifdef dbgTimingSubstages
+		trace_steps += 1;
+#endif
 		link = tb->space[tbRow[row] + col];
 		op = link & cidBits;
 		if ((prevOp == cFromI) && ((link & iExtend) != 0)) op = cFromI;
@@ -3857,11 +3992,23 @@ dp_finished:
 		else                   { row--;  col--;  edit_script_sub (script, 1); }
 		snoopTraceback_3
 		}
+#ifdef dbgTimingSubstages
+	{ u64 t_trace_out = __rdtsc();
+	  rdtsc_yda_traceback_cyc   += t_trace_out - t_trace_in;
+	  rdtsc_yda_traceback_steps += trace_steps; }
+
+	u64 t_cleanup_in = __rdtsc();
+#endif
 
 	filter_active_segs (&active, 2);	// (disposes of everything in the list)
 
 	free_if_valid ("ydrop_one_sided_align dynProg->p", dynProg->p);
 	free_if_valid ("ydrop_one_sided_align dynProg",    dynProg);
+
+#ifdef dbgTimingSubstages
+	{ u64 t_cleanup_out = __rdtsc();
+	  rdtsc_yda_cleanup_cyc += t_cleanup_out - t_cleanup_in; }
+#endif
 
 	if (endIsBoundary) return boundaryScore;
 	              else return bestScore;

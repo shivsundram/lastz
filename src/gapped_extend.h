@@ -176,5 +176,9 @@ void report_gapped_extend_types (FILE* f);
 void gapped_extend_timing_report (FILE* f);
 #endif // dbgTimingGappedExtend
 
+#ifdef dbgTimingSubstages
+void gapped_extend_substage_report (FILE* f);
+#endif // dbgTimingSubstages
+
 #undef global
 #endif // gapped_extend_H

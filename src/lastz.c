@@ -2071,6 +2071,7 @@ show_stats_and_clean_up:
 
 #ifdef dbgTimingSubstages
 	seed_search_substage_report (stageF);
+	gapped_extend_substage_report (stageF);
 #endif // dbgTimingSubstages
 
 	fprintf (stageF, "===STAGE_TIMING_END===\n");
