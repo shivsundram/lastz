@@ -90,7 +90,7 @@ CFLAGS = -O3 ${definedForAll} ${VERSION_FLAGS}
 
 srcFiles = lastz infer_scores \
            seeds pos_table quantum seed_search diag_hash                  \
-           chain gapped_extend tweener masking                            \
+           chain gapped_extend ydrop_sane tweener masking                 \
            segment edit_script                                            \
            identity_dist coverage_dist continuity_dist                    \
            output gfa lav axt maf cigar sam genpaf text_align align_diffs \
@@ -98,7 +98,7 @@ srcFiles = lastz infer_scores \
 
 incFiles = lastz.h infer_scores.h \
            seeds.h pos_table.h quantum.h seed_search.h diag_hash.h                            \
-           chain.h gapped_extend.h tweener.h masking.h                                        \
+           chain.h gapped_extend.h ydrop_sane.h tweener.h masking.h                           \
            segment.h edit_script.h                                                            \
            identity_dist.h coverage_dist.h continuity_dist.h                                  \
            output.h gfa.h lav.h axt.h maf.h sam.h cigar.h genpaf.h text_align.h align_diffs.h \

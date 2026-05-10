@@ -6016,3 +6016,58 @@ void report_gapped_extend_types
 	fprintf (f,"size of alignio     is %d\n",  (int) sizeof(alignio));
 	}
 
+//----------
+//
+// ydrop_one_sided_align_for_testing--
+//   Non-static trampoline that constructs a minimal alignio (anchor=0,0;
+//   no left/right neighbor alignments; no above/below mask lists) and
+//   forwards to the file-static ydrop_one_sided_align. Used by the
+//   bench/test_ydrop.c validation driver in the parent quals tree. Zero
+//   behavior change to any other lastz code path.
+//
+//----------
+
+score ydrop_one_sided_align_for_testing
+   (u8*			A,
+	u8*			B,
+	unspos		M,
+	unspos		N,
+	scoreset*	scoring,
+	score		yDrop,
+	tback*		tb,
+	int			reversed,
+	int			trimToPeak,
+	editscript** script,
+	unspos*		end1,
+	unspos*		end2)
+	{
+	alignio io;
+	memset (&io, 0, sizeof(io));
+	io.seq1       = A;
+	io.seq2       = B;
+	io.rev1       = NULL;
+	io.rev2       = NULL;
+	io.len1       = M;
+	io.len2       = N;
+	io.low1       = 0;
+	io.low2       = 0;
+	io.high1      = M;
+	io.high2      = N;
+	io.anchor1    = 0;
+	io.anchor2    = 0;
+	io.hspId      = 0;
+	io.scoring    = scoring;
+	io.yDrop      = yDrop;
+	io.trimToPeak = trimToPeak;
+	io.tb         = tb;
+	io.leftAlign  = NULL;
+	io.rightAlign = NULL;
+	io.leftSeg    = NULL;
+	io.rightSeg   = NULL;
+	io.aboveList  = NULL;
+	io.belowList  = NULL;
+
+	return ydrop_one_sided_align (&io, reversed, A, B, M, N,
+	                              trimToPeak, script, end1, end2);
+	}
+

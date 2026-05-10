@@ -180,5 +180,24 @@ void gapped_extend_timing_report (FILE* f);
 void gapped_extend_substage_report (FILE* f);
 #endif // dbgTimingSubstages
 
+// Non-static trampoline for external test drivers (bench/test_ydrop.c).
+// Constructs a minimal alignio (anchor=0,0; leftSeg/rightSeg/leftAlign/
+// rightAlign/aboveList/belowList all NULL) and forwards to the file-static
+// ydrop_one_sided_align. The 'scoring' and 'tb' must be supplied by the
+// caller; tb is reused across calls and freed by the caller.
+score ydrop_one_sided_align_for_testing
+   (u8*         A,
+    u8*         B,
+    unspos      M,
+    unspos      N,
+    scoreset*   scoring,
+    score       yDrop,
+    tback*      tb,
+    int         reversed,
+    int         trimToPeak,
+    editscript** script,
+    unspos*     end1,
+    unspos*     end2);
+
 #undef global
 #endif // gapped_extend_H
