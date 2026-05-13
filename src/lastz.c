@@ -2074,6 +2074,11 @@ show_stats_and_clean_up:
 	gapped_extend_substage_report (stageF);
 #endif // dbgTimingSubstages
 
+	// Runtime A/B swap (YDROP_SANE_IMPL): always reported when timing is
+	// on, regardless of substage build. Reports a no-op when the swap
+	// wasn't activated for this run.
+	ydrop_sane_swap_report (stageF);
+
 	fprintf (stageF, "===STAGE_TIMING_END===\n");
 	fflush (stageF);
 	if (stageOwnsFile) fclose (stageF);

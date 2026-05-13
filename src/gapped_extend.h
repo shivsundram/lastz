@@ -180,6 +180,12 @@ void gapped_extend_timing_report (FILE* f);
 void gapped_extend_substage_report (FILE* f);
 #endif // dbgTimingSubstages
 
+// Runtime A/B swap stats. Reports the number of ydrop_one_sided_align
+// calls that were diverted to ydrop_one_sided_align_impl_sane_double_buffered
+// (via the YDROP_SANE_IMPL=1 env var) vs the number declined as out-of-
+// scope vs the total. Always defined; safe to call in any build.
+void ydrop_sane_swap_report (FILE* f);
+
 // Non-static trampoline for external test drivers (bench/test_ydrop.c).
 // Constructs a minimal alignio (anchor=0,0; leftSeg/rightSeg/leftAlign/
 // rightAlign/aboveList/belowList all NULL) and forwards to the file-static

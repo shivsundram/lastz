@@ -69,6 +69,7 @@
 
 #define  gapped_extend_owner	// (make this the owner of its globals)
 #include "gapped_extend.h"		// interface to this module
+#include "ydrop_sane.h"			// textbook ports for runtime A/B swap
 
 //----------
 //
@@ -3476,6 +3477,175 @@ void free_traceback_rows (void)
 	}
 
 
+//----------
+//
+// Runtime A/B swap to ydrop_one_sided_align_impl_sane_double_buffered.
+//
+// When the env var YDROP_SANE_IMPL is set (and not "0"), and a given
+// ydrop_one_sided_align call is in the v0 scope (no left/right neighbor
+// segments, no above/below active-segment list, trimToPeak == true),
+// divert to the textbook double-buffered port in ydrop_sane.c. Used for
+// in-situ wall-clock A/B comparisons between lastz's optimized DP and
+// the reference impl on real workloads.
+//
+// Stats are reported via ydrop_sane_swap_report() and (when the env var
+// is set) via an atexit handler installed lazily on first call.
+//
+//----------
+
+static u64 ydrop_sane_swap_total       = 0;  // total ydrop_one_sided_align calls
+static u64 ydrop_sane_swap_calls       = 0;  // swapped to sane impl
+static u64 ydrop_sane_swap_declined    = 0;  // sane enabled, but out-of-scope
+
+// Per-reason decline counters (sum equals ydrop_sane_swap_declined when
+// enabled; only the FIRST failing condition is counted per call).
+static u64 ydrop_sane_decl_leftSeg     = 0;
+static u64 ydrop_sane_decl_rightSeg    = 0;
+static u64 ydrop_sane_decl_leftAlign   = 0;
+static u64 ydrop_sane_decl_rightAlign  = 0;
+static u64 ydrop_sane_decl_alignList   = 0;
+static u64 ydrop_sane_decl_noTrim      = 0;
+
+static int ydrop_sane_swap_reported = 0;
+
+#ifdef dbgTimingSubstages
+static u64 ydrop_sane_swap_cyc         = 0;  // total cycles spent in sane impl
+#endif
+
+static void ydrop_sane_swap_atexit (void);
+
+static int ydrop_sane_swap_enabled (void)
+	{
+	static int initialized = 0;
+	static int enabled     = 0;
+	if (!initialized)
+		{
+		const char *env = getenv ("YDROP_SANE_IMPL");
+		enabled = (env != NULL && env[0] != '\0' && env[0] != '0');
+		initialized = 1;
+		if (enabled)
+			{
+			fprintf (stderr,
+			         "[ydrop_sane] runtime swap ENABLED (YDROP_SANE_IMPL=%s)\n",
+			         env);
+			atexit (ydrop_sane_swap_atexit);
+			}
+		}
+	return enabled;
+	}
+
+static int ydrop_sane_swap_try
+   (alignio *io, int reversed,
+    u8 *A, u8 *B, unspos M, unspos N,
+    int trimToPeak,
+    editscript **script, unspos *end1, unspos *end2,
+    score *out_score)
+	{
+	ydrop_sane_swap_total++;
+
+	if (!ydrop_sane_swap_enabled ()) return 0;
+
+	// V0 scope guard. We swap only when ALL of the following hold:
+	//   - no left/right neighbor segments (otherwise lastz's L/R bounds
+	//     are clamped against them);
+	//   - no left/right neighbor alignments (next_sweep_seg can still
+	//     drive L/R updates from these even when the immediate segment
+	//     is NULL);
+	//   - no above/below active-segment list to mask out (the alignList
+	//     drives mask propagation through filter_active_segs);
+	//   - trimToPeak == true (sane only handles the peak endpoint).
+	// Out-of-scope calls fall through to lastz proper.
+
+	if (io->leftSeg    != NULL)
+		{ ydrop_sane_decl_leftSeg++;    ydrop_sane_swap_declined++; return 0; }
+	if (io->rightSeg   != NULL)
+		{ ydrop_sane_decl_rightSeg++;   ydrop_sane_swap_declined++; return 0; }
+	if (io->leftAlign  != NULL)
+		{ ydrop_sane_decl_leftAlign++;  ydrop_sane_swap_declined++; return 0; }
+	if (io->rightAlign != NULL)
+		{ ydrop_sane_decl_rightAlign++; ydrop_sane_swap_declined++; return 0; }
+	if ((!reversed && io->aboveList != NULL)
+	 || ( reversed && io->belowList != NULL))
+		{ ydrop_sane_decl_alignList++;  ydrop_sane_swap_declined++; return 0; }
+	if (!trimToPeak)
+		{ ydrop_sane_decl_noTrim++;     ydrop_sane_swap_declined++; return 0; }
+
+#ifdef dbgTimingSubstages
+	u64 t_in = __rdtsc ();
+#endif
+	*out_score = ydrop_one_sided_align_impl_sane_double_buffered (
+	                 A, M, B, N,
+	                 io->scoring->sub,
+	                 io->scoring->gapOpen,
+	                 io->scoring->gapExtend,
+	                 io->yDrop,
+	                 script, end1, end2);
+#ifdef dbgTimingSubstages
+	ydrop_sane_swap_cyc += __rdtsc () - t_in;
+#endif
+
+	ydrop_sane_swap_calls++;
+	return 1;
+	}
+
+void ydrop_sane_swap_report (FILE *f)
+	{
+	if (ydrop_sane_swap_total == 0) return;
+	ydrop_sane_swap_reported = 1;
+	fprintf (f, "--- ydrop_sane runtime swap ---\n");
+	fprintf (f, "%-32s %20llu\n", "total ydrop calls",
+	         (unsigned long long) ydrop_sane_swap_total);
+	double swap_pct = 100.0 * (double) ydrop_sane_swap_calls
+	                        / (double) ydrop_sane_swap_total;
+	double decl_pct = 100.0 * (double) ydrop_sane_swap_declined
+	                        / (double) ydrop_sane_swap_total;
+	fprintf (f, "%-32s %20llu  (%.1f%%)\n", "swapped to sane (double_buf)",
+	         (unsigned long long) ydrop_sane_swap_calls, swap_pct);
+	fprintf (f, "%-32s %20llu  (%.1f%%)\n", "declined (out of v0 scope)",
+	         (unsigned long long) ydrop_sane_swap_declined, decl_pct);
+
+	if (ydrop_sane_swap_declined > 0)
+		{
+		fprintf (f, "  decline reasons (first failing condition per call):\n");
+		fprintf (f, "    %-26s %20llu\n", "leftSeg != NULL",
+		         (unsigned long long) ydrop_sane_decl_leftSeg);
+		fprintf (f, "    %-26s %20llu\n", "rightSeg != NULL",
+		         (unsigned long long) ydrop_sane_decl_rightSeg);
+		fprintf (f, "    %-26s %20llu\n", "leftAlign != NULL",
+		         (unsigned long long) ydrop_sane_decl_leftAlign);
+		fprintf (f, "    %-26s %20llu\n", "rightAlign != NULL",
+		         (unsigned long long) ydrop_sane_decl_rightAlign);
+		fprintf (f, "    %-26s %20llu\n", "above/belowList != NULL",
+		         (unsigned long long) ydrop_sane_decl_alignList);
+		fprintf (f, "    %-26s %20llu\n", "trimToPeak == false",
+		         (unsigned long long) ydrop_sane_decl_noTrim);
+		}
+#ifdef dbgTimingSubstages
+	if (ydrop_sane_swap_calls > 0)
+		{
+		double cyc_per = (double) ydrop_sane_swap_cyc
+		               / (double) ydrop_sane_swap_calls;
+		fprintf (f, "%-32s %20llu  (%.1f cyc/call)\n",
+		         "cycles in sane impl",
+		         (unsigned long long) ydrop_sane_swap_cyc, cyc_per);
+		}
+#endif
+	}
+
+static void ydrop_sane_swap_atexit (void)
+	{
+	// Fallback report path for builds without dbgTiming. lastz.c calls
+	// ydrop_sane_swap_report() inside its stage-timing block when built
+	// with -DdbgTiming; that path runs FIRST (before atexit handlers
+	// fire) and sets ydrop_sane_swap_reported, so we skip the duplicate
+	// here. For builds without dbgTiming, this atexit is the only path
+	// that emits stats.
+	if (ydrop_sane_swap_reported) return;
+	if (ydrop_sane_swap_total    == 0) return;
+	if (ydrop_sane_swap_calls    == 0 && ydrop_sane_swap_declined == 0) return;
+	ydrop_sane_swap_report (stderr);
+	}
+
 //=== ydrop_one_sided_align ===
 // ~~~ github issue 52 ~~~ 
 // tbLen should be u32, not int
@@ -3551,6 +3721,17 @@ static score ydrop_one_sided_align
 
 	if ((N <= 0) || (M <= 0))
 		{ *(_end1) = *(_end2) = 0;  return 0; }
+
+	// Runtime A/B swap to ydrop_one_sided_align_impl_sane_double_buffered:
+	// fires when YDROP_SANE_IMPL=1 is in the environment AND this call is
+	// in the v0 scope (no neighbor segments, no active above/below list,
+	// trimToPeak == true). Out-of-scope calls fall through to lastz proper.
+	{
+	score swap_score;
+	if (ydrop_sane_swap_try (io, reversed, A, B, M, N, trimToPeak,
+	                         script, _end1, _end2, &swap_score))
+		return swap_score;
+	}
 
 #if ((defined snoopAnchors) || ((defined snoopAlgorithm) && (defined debugPosA1)))
 	fprintf (stderr,"[hspId=" u64Fmt "] ydrop_one_sided_align(" unsposSlashFmt ") %s\n",
