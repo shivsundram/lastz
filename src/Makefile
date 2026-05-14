@@ -76,6 +76,18 @@ ifeq ($(stageTimers), ON)
 	definedForAll += -DdbgTiming -DdbgTimingGappedExtend
 endif
 
+# When omp=ON, build with OpenMP enabled (-fopenmp on both compile and link).
+# With no #pragma omp directives in the source, this is a no-op at runtime
+# beyond the addition of libgomp to the link. The parallel y-drop path is
+# additionally gated at runtime by the LASTZ_PARALLEL_YDROP env var, so a
+# build with omp=ON still produces baseline single-threaded behavior unless
+# that env var is set. See README §11 ("T1 batched parallel y-drop").
+omp ?= 0
+ifeq ($(omp), ON)
+	OMP_CFLAGS  = -fopenmp
+	OMP_LDFLAGS = -fopenmp
+endif
+
 
 VERSION_FLAGS= \
 	-DVERSION_MAJOR="\"${VERSION_MAJOR}"\" \
@@ -85,7 +97,7 @@ VERSION_FLAGS= \
 	-DSUBVERSION_REV="\"${SUBVERSION_REV}"\"
 
 
-CFLAGS = -O3 ${definedForAll} ${VERSION_FLAGS}
+CFLAGS = -O3 ${definedForAll} ${VERSION_FLAGS} ${OMP_CFLAGS}
 
 
 srcFiles = lastz infer_scores \
@@ -134,22 +146,22 @@ incFiles = lastz.h infer_scores.h \
 
 
 lastz: $(foreach part,${srcFiles},${part}.o)
-	${CC} $(foreach part,${srcFiles},${part}.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}.o) -lm ${OMP_LDFLAGS} -o $@
 
 lastz_D: $(foreach part,${srcFiles},${part}_D.o)
-	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm ${OMP_LDFLAGS} -o $@
 
 lastz_32: $(foreach part,${srcFiles},${part}_32.o)
-	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm ${OMP_LDFLAGS} -o $@
 
 lastz_40: $(foreach part,${srcFiles},${part}_40.o)
-	${CC} $(foreach part,${srcFiles},${part}_40.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}_40.o) -lm ${OMP_LDFLAGS} -o $@
 
 lastz_T: $(foreach part,${srcFiles},${part}_T.o)
-	${CC} -g $(foreach part,${srcFiles},${part}_T.o) -lm -o $@
+	${CC} -g $(foreach part,${srcFiles},${part}_T.o) -lm ${OMP_LDFLAGS} -o $@
 
 lastz_TS: $(foreach part,${srcFiles},${part}_TS.o)
-	${CC} -g $(foreach part,${srcFiles},${part}_TS.o) -lm -o $@
+	${CC} -g $(foreach part,${srcFiles},${part}_TS.o) -lm ${OMP_LDFLAGS} -o $@
 
 # cleanup
 
