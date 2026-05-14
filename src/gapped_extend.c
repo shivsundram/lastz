@@ -167,6 +167,143 @@ void gapped_extend_substage_report (FILE* f)
 	}
 #endif // dbgTimingSubstages
 
+//----------
+//
+// Anchor-loop sequential-dependency instrumentation (always-on).
+//
+// At the outer anchor loop in gapped_extend(), each anchor is either
+// (a) skipped because it's contained in a previously-emitted alignment
+// (msp_left_right returns false), or (b) y-dropped, with bounds derived
+// from earlier alignments via leftSeg/rightSeg/aboveList/belowList.
+// These counters measure how much of the work is gated by that
+// sequential dependency, and how long the neighbor-alignment chains are
+// when y-drop does fire. Reported via gapped_extend_anchor_loop_report.
+//
+//----------
+
+static u64 alstats_total_anchors        = 0;
+static u64 alstats_skipped_contained    = 0;
+static u64 alstats_ran_ydrop_align      = 0;
+static u64 alstats_above_chain_sum      = 0;
+static u64 alstats_above_chain_max      = 0;
+static u64 alstats_above_chain_nonempty = 0;
+static u64 alstats_below_chain_sum      = 0;
+static u64 alstats_below_chain_max      = 0;
+static u64 alstats_below_chain_nonempty = 0;
+
+void gapped_extend_anchor_loop_report (FILE *f)
+	{
+	if (alstats_total_anchors == 0) return;
+	fprintf (f, "--- anchor-loop sequential dependency ---\n");
+	fprintf (f, "%-32s %20llu\n", "total anchors seen",
+	         (unsigned long long) alstats_total_anchors);
+
+	double skip_pct = 100.0 * (double) alstats_skipped_contained
+	                        / (double) alstats_total_anchors;
+	double ran_pct  = 100.0 * (double) alstats_ran_ydrop_align
+	                        / (double) alstats_total_anchors;
+	fprintf (f, "%-32s %20llu  (%.1f%%)\n", "skipped (contained, no ydrop)",
+	         (unsigned long long) alstats_skipped_contained, skip_pct);
+	fprintf (f, "%-32s %20llu  (%.1f%%)\n", "ran ydrop_align",
+	         (unsigned long long) alstats_ran_ydrop_align, ran_pct);
+
+	if (alstats_ran_ydrop_align > 0)
+		{
+		double above_nonempty_pct = 100.0 * (double) alstats_above_chain_nonempty
+		                                  / (double) alstats_ran_ydrop_align;
+		double below_nonempty_pct = 100.0 * (double) alstats_below_chain_nonempty
+		                                  / (double) alstats_ran_ydrop_align;
+		double above_mean = alstats_above_chain_nonempty == 0 ? 0.0
+		                  : (double) alstats_above_chain_sum
+		                  / (double) alstats_above_chain_nonempty;
+		double below_mean = alstats_below_chain_nonempty == 0 ? 0.0
+		                  : (double) alstats_below_chain_sum
+		                  / (double) alstats_below_chain_nonempty;
+		fprintf (f, "  among ran-ydrop calls:\n");
+		fprintf (f, "  %-30s %20llu  (%.1f%% of ran)  mean_len=%.1f  max_len=%llu\n",
+		         "aboveList non-empty",
+		         (unsigned long long) alstats_above_chain_nonempty,
+		         above_nonempty_pct, above_mean,
+		         (unsigned long long) alstats_above_chain_max);
+		fprintf (f, "  %-30s %20llu  (%.1f%% of ran)  mean_len=%.1f  max_len=%llu\n",
+		         "belowList non-empty",
+		         (unsigned long long) alstats_below_chain_nonempty,
+		         below_nonempty_pct, below_mean,
+		         (unsigned long long) alstats_below_chain_max);
+		}
+	}
+
+//----------
+//
+// Per-call ydrop log (env-var gated).
+//
+// When the env var YDROP_CALL_LOG=<path> is set, emit one CSV row per
+// non-trivial ydrop_one_sided_align call, capturing the matrix shape
+// (M, N), the band the DP actually swept (max_band, cells_visited),
+// the row count, the wall-clock cycles spent, and the peak score with
+// its (row, col). Swapped-to-sane calls are NOT logged (the swap path
+// returns before the row loop runs).
+//
+//----------
+
+#ifndef dbgTimingSubstages
+#include <x86intrin.h>          // __rdtsc()
+#endif
+
+static u32  ydrop_call_id          = 0;
+static int  ydrop_log_initialized  = -1;  // -1 = not yet checked
+static FILE *ydrop_log_fp          = NULL;
+
+static void ydrop_call_log_close (void)
+	{
+	if (ydrop_log_fp != NULL && ydrop_log_fp != stderr)
+		{
+		fflush (ydrop_log_fp);
+		fclose (ydrop_log_fp);
+		ydrop_log_fp = NULL;
+		}
+	}
+
+static void ydrop_call_log_init (void)
+	{
+	if (ydrop_log_initialized >= 0) return;
+	const char *path = getenv ("YDROP_CALL_LOG");
+	if (path == NULL || path[0] == '\0')
+		{ ydrop_log_initialized = 0; return; }
+	ydrop_log_fp = fopen (path, "w");
+	if (ydrop_log_fp == NULL)
+		{
+		fprintf (stderr,
+		         "[ydrop_call_log] could not open %s for writing; logging disabled\n",
+		         path);
+		ydrop_log_initialized = 0;
+		return;
+		}
+	fprintf (ydrop_log_fp,
+	         "call_id,reversed,trimToPeak,M,N,rows_processed,max_band,"
+	         "cells_visited,cycles_total,peak_score,peak_row,peak_col\n");
+	atexit (ydrop_call_log_close);
+	fprintf (stderr, "[ydrop_call_log] logging to %s\n", path);
+	ydrop_log_initialized = 1;
+	}
+
+static inline void ydrop_call_log_emit
+   (u32 call_id, int reversed, int trimToPeak,
+    u64 M, u64 N, u32 rows, u32 max_band,
+    u64 cells, u64 cycles,
+    s64 peak_score, u64 peak_row, u64 peak_col)
+	{
+	if (ydrop_log_fp == NULL) return;
+	fprintf (ydrop_log_fp,
+	         "%u,%d,%d,%llu,%llu,%u,%u,%llu,%llu,%lld,%llu,%llu\n",
+	         call_id, reversed, trimToPeak,
+	         (unsigned long long) M, (unsigned long long) N,
+	         rows, max_band,
+	         (unsigned long long) cells, (unsigned long long) cycles,
+	         (long long) peak_score,
+	         (unsigned long long) peak_row, (unsigned long long) peak_col);
+	}
+
 // debugging defines
 
 //#define snoopAnchors			// if this is defined, extra code is added to
@@ -1429,8 +1566,28 @@ alignel* gapped_extend
 
 			// find the horizontal bounding alignments/segments of this anchor
 
-			if (!msp_left_right (orderBegInc, mp))
+			alstats_total_anchors++;
+			{
+			int contained = !msp_left_right (orderBegInc, mp);
+			// LASTZ_DISABLE_CONTAINMENT=1: cache once, ignore containment
+			// skip even when an earlier alignment fully contains this anchor.
+			// Used by variant 2b of the cross-anchor-dependency study to
+			// simulate "every anchor in msp[] runs y-drop, no coordination".
+			static int containment_disabled = -1;
+			if (containment_disabled < 0)
+				{
+				const char *e = getenv ("LASTZ_DISABLE_CONTAINMENT");
+				containment_disabled = (e != NULL && e[0] != '\0' && e[0] != '0');
+				if (containment_disabled)
+					fprintf (stderr, "[lastz] LASTZ_DISABLE_CONTAINMENT=1: ignoring msp_left_right skip\n");
+				}
+			if (contained && !containment_disabled)
+				{
+				alstats_skipped_contained++;
 				continue;		// (an earlier alignment contains this anchor)
+				}
+			}
+			alstats_ran_ydrop_align++;
 
 			io.leftAlign  = mp->leftAlign1;
 			io.rightAlign = mp->rightAlign1;
@@ -1447,6 +1604,45 @@ alignel* gapped_extend
 			dbg_timing_gapped_extend_sub (debugClockAboveBelow);
 			get_above_below (&io, orderBegInc, orderEndDec);
 			dbg_timing_gapped_extend_add (debugClockAboveBelow);
+
+			// measure aboveList/belowList chain lengths to gauge the
+			// neighbor-alignment coupling that lastz feeds into y-drop
+			{
+			u64 above_len = 0;
+			galign *g;
+			for (g = io.aboveList; g != NULL; g = g->next) above_len++;
+			alstats_above_chain_sum += above_len;
+			if (above_len > alstats_above_chain_max) alstats_above_chain_max = above_len;
+			if (above_len > 0) alstats_above_chain_nonempty++;
+
+			u64 below_len = 0;
+			for (g = io.belowList; g != NULL; g = g->prev) below_len++;
+			alstats_below_chain_sum += below_len;
+			if (below_len > alstats_below_chain_max) alstats_below_chain_max = below_len;
+			if (below_len > 0) alstats_below_chain_nonempty++;
+			}
+
+			// LASTZ_DISABLE_NEIGHBOR_MASK=1: cache once, zero out all six
+			// neighbor-coupling alignio fields right before ydrop_align.
+			// Y-drop then runs without per-row cell masking and without
+			// per-row L/R clamping against neighbor segments. Used by
+			// variants 2a and 2b of the cross-anchor-dependency study.
+			{
+			static int mask_disabled = -1;
+			if (mask_disabled < 0)
+				{
+				const char *e = getenv ("LASTZ_DISABLE_NEIGHBOR_MASK");
+				mask_disabled = (e != NULL && e[0] != '\0' && e[0] != '0');
+				if (mask_disabled)
+					fprintf (stderr, "[lastz] LASTZ_DISABLE_NEIGHBOR_MASK=1: nulling out leftSeg/rightSeg/leftAlign/rightAlign/aboveList/belowList\n");
+				}
+			if (mask_disabled)
+				{
+				io.leftSeg    = io.rightSeg   = NULL;
+				io.leftAlign  = io.rightAlign = NULL;
+				io.aboveList  = io.belowList  = NULL;
+				}
+			}
 
 			// if either sequence is partitioned, figure out the limits of the
 			// partition containing this anchor
@@ -3733,6 +3929,17 @@ static score ydrop_one_sided_align
 		return swap_score;
 	}
 
+	// Per-call ydrop log (env-var gated). One CSV row per non-trivial,
+	// non-swapped call. The accumulators below feed the emit at function
+	// exit; the rdtsc read costs ~25 cycles and only fires when logging
+	// is enabled.
+	ydrop_call_log_init ();
+	u32 yc_call_id = ydrop_call_id++;
+	u64 yc_cells   = 0;
+	u32 yc_rows    = 0;
+	u32 yc_maxband = 0;
+	u64 yc_t_in    = (ydrop_log_initialized == 1) ? __rdtsc () : 0;
+
 #if ((defined snoopAnchors) || ((defined snoopAlgorithm) && (defined debugPosA1)))
 	fprintf (stderr,"[hspId=" u64Fmt "] ydrop_one_sided_align(" unsposSlashFmt ") %s\n",
 	                 io->hspId, io->anchor1, io->anchor2,
@@ -4077,6 +4284,15 @@ static score ydrop_one_sided_align
 
 		gapped_extend_add_stat (dpCellsVisited, col-leftCol);
 
+		// per-call accumulators for YDROP_CALL_LOG
+		{
+		u32 row_cells = (col > leftCol) ? (u32)(col - leftCol) : 0;
+		u32 row_band  = (RY > LY) ? (u32)(RY - LY) : 0;
+		yc_cells += row_cells;
+		yc_rows++;
+		if (row_band > yc_maxband) yc_maxband = row_band;
+		}
+
 		// if the feasible region is empty, we're done
 
 		if (LY >= RY)
@@ -4190,6 +4406,16 @@ dp_finished:
 	{ u64 t_cleanup_out = __rdtsc();
 	  rdtsc_yda_cleanup_cyc += t_cleanup_out - t_cleanup_in; }
 #endif
+
+	if (ydrop_log_initialized == 1)
+		{
+		u64 yc_cycles = __rdtsc () - yc_t_in;
+		score yc_peak = endIsBoundary ? boundaryScore : bestScore;
+		ydrop_call_log_emit (yc_call_id, reversed, trimToPeak,
+		                     (u64) M, (u64) N, yc_rows, yc_maxband,
+		                     yc_cells, yc_cycles,
+		                     (s64) yc_peak, (u64) end1, (u64) end2);
+		}
 
 	if (endIsBoundary) return boundaryScore;
 	              else return bestScore;

@@ -2079,6 +2079,11 @@ show_stats_and_clean_up:
 	// wasn't activated for this run.
 	ydrop_sane_swap_report (stageF);
 
+	// Anchor-loop sequential dependency: always reported. Tells us what
+	// fraction of anchors lastz skipped via the outer containment check
+	// vs ran y-drop on, and how long the neighbor-alignment chains were.
+	gapped_extend_anchor_loop_report (stageF);
+
 	fprintf (stageF, "===STAGE_TIMING_END===\n");
 	fflush (stageF);
 	if (stageOwnsFile) fclose (stageF);

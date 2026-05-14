@@ -186,6 +186,12 @@ void gapped_extend_substage_report (FILE* f);
 // scope vs the total. Always defined; safe to call in any build.
 void ydrop_sane_swap_report (FILE* f);
 
+// Anchor-loop sequential-dependency stats. Reports how many anchors
+// were skipped by msp_left_right's containment check, how many ran
+// y-drop, and the length distribution of the aboveList / belowList
+// neighbor-alignment chains. Always defined; safe to call in any build.
+void gapped_extend_anchor_loop_report (FILE* f);
+
 // Non-static trampoline for external test drivers (bench/test_ydrop.c).
 // Constructs a minimal alignio (anchor=0,0; leftSeg/rightSeg/leftAlign/
 // rightAlign/aboveList/belowList all NULL) and forwards to the file-static
