@@ -192,6 +192,12 @@ void ydrop_sane_swap_report (FILE* f);
 // neighbor-alignment chains. Always defined; safe to call in any build.
 void gapped_extend_anchor_loop_report (FILE* f);
 
+// Batched parallel y-drop (T1) stats. Reports the batch size, the
+// number of batches dispatched, and the number of anchors processed
+// through the parallel path. Only emits a report when
+// LASTZ_PARALLEL_YDROP was active for the run; no-op otherwise.
+void gapped_extend_parallel_ydrop_report (FILE* f);
+
 // Non-static trampoline for external test drivers (bench/test_ydrop.c).
 // Constructs a minimal alignio (anchor=0,0; leftSeg/rightSeg/leftAlign/
 // rightAlign/aboveList/belowList all NULL) and forwards to the file-static

@@ -2084,6 +2084,10 @@ show_stats_and_clean_up:
 	// vs ran y-drop on, and how long the neighbor-alignment chains were.
 	gapped_extend_anchor_loop_report (stageF);
 
+	// Batched parallel y-drop (T1). Only emits when LASTZ_PARALLEL_YDROP
+	// was set; otherwise a no-op.
+	gapped_extend_parallel_ydrop_report (stageF);
+
 	fprintf (stageF, "===STAGE_TIMING_END===\n");
 	fflush (stageF);
 	if (stageOwnsFile) fclose (stageF);

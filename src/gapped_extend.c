@@ -235,6 +235,67 @@ void gapped_extend_anchor_loop_report (FILE *f)
 
 //----------
 //
+// Batched parallel y-drop (T1).
+//
+// Activated by LASTZ_PARALLEL_YDROP=K in the environment (K = batch
+// size, e.g. 64). When activated, the inner anchor loop of
+// gapped_extend dispatches to a batched parallel path that uses
+// ydrop_align_sane (which wraps ydrop_one_sided_align_impl_sane_-
+// double_buffered) as the per-thread y-drop kernel. Because the sane
+// impl allocates all its scratch on the heap, multiple threads can
+// run it concurrently without touching the module-static tback /
+// dpMatrix buffers.
+//
+// Parallel mode forces masking off (NULLs leftSeg/rightSeg/leftAlign
+// /rightAlign/aboveList/belowList for every call) — the cross-anchor
+// dependency study (README §11) shows masking is cosmetic on output
+// (bp-set Jaccard 0.9977 vs baseline) and the sane impl is only
+// validated against the no-masking scope. Containment-skip
+// (msp_left_right) is still applied, against the orderBegInc state
+// committed by the previous batch.
+//
+// Thread count is controlled by OMP_NUM_THREADS. With omp=ON and
+// LASTZ_PARALLEL_YDROP unset, this code never fires; the baseline
+// serial path runs unchanged.
+//
+//----------
+
+static int parallel_ydrop_initialized = -1;
+static u32 parallel_ydrop_batch_size  = 0;
+static u64 parallel_ydrop_batches     = 0;
+static u64 parallel_ydrop_anchors     = 0;
+
+static void parallel_ydrop_init (void)
+	{
+	if (parallel_ydrop_initialized >= 0) return;
+	const char *e = getenv ("LASTZ_PARALLEL_YDROP");
+	if (e != NULL && e[0] != '\0' && e[0] != '0')
+		{
+		long v = strtol (e, NULL, 10);
+		if (v <= 0) v = 64;	 // bare "1" / non-numeric -> default batch
+		parallel_ydrop_batch_size = (u32) v;
+		fprintf (stderr,
+		         "[lastz] LASTZ_PARALLEL_YDROP=%u: batched parallel y-drop on"
+		         " (sane impl, masking forced off)\n",
+		         parallel_ydrop_batch_size);
+		}
+	parallel_ydrop_initialized = (parallel_ydrop_batch_size > 0);
+	}
+
+void gapped_extend_parallel_ydrop_report (FILE *f)
+	{
+	if (parallel_ydrop_batch_size == 0) return;
+	fprintf (f, "--- batched parallel y-drop ---\n");
+	fprintf (f, "%-32s %20u\n", "batch size",
+	         parallel_ydrop_batch_size);
+	fprintf (f, "%-32s %20llu\n", "batches dispatched",
+	         (unsigned long long) parallel_ydrop_batches);
+	fprintf (f, "%-32s %20llu\n", "anchors processed (parallel)",
+	         (unsigned long long) parallel_ydrop_anchors);
+	}
+
+//----------
+//
 // Per-call ydrop log (env-var gated).
 //
 // When the env var YDROP_CALL_LOG=<path> is set, emit one CSV row per
@@ -628,6 +689,7 @@ static score    score_identical_partition_of
                                     partition* p1,
                                     scoreset* scoring);
 static void     ydrop_align        (alignio* io);
+static void     ydrop_align_sane   (alignio* io);
 static score    ydrop_one_sided_align (alignio* io, int reversed,
                                     u8* A, u8* B, unspos M, unspos N,
                                     int trimToPeak,
@@ -1288,6 +1350,10 @@ alignel* gapped_extend
 		suicidef ("gapped_extend can't handle score threshold %s",
 		          score_thresh_to_string (&scoreThresh));
 
+	// initialize parallel y-drop (T1) mode once per run; sets
+	// parallel_ydrop_batch_size from LASTZ_PARALLEL_YDROP env var.
+	parallel_ydrop_init ();
+
 	// create a gapped alignment table containing one entry for each HSP (plus
 	// an additional slot for each possible trivial self-alignment-- see
 	// note (1) in init_from_anchors);  note that batched_segments sorts the
@@ -1530,8 +1596,205 @@ alignel* gapped_extend
 		// convert each anchor in this batch to a gapped extension, processing
 		// the anchors from high score to low (they've previously been sorted
 		// into that order)
+		//
+		// If LASTZ_PARALLEL_YDROP is active, run the T1 batched parallel
+		// path: anchors in [startSegIx, endSegIx) are processed in chunks
+		// of parallel_ydrop_batch_size; within each chunk, y-drop runs in
+		// parallel via ydrop_align_sane, then a serial commit pass applies
+		// score-threshold filtering, align_left_right, and insert_align.
+		// The chunk's containment check sees the orderBegInc state
+		// committed by the previous chunk (stale-but-monotone). Output
+		// drifts slightly from the serial path because batch-stale
+		// containment lets a few extra anchors through; this is the same
+		// trade-off as the cross-anchor-dependency study's variant 2a.
+		// Falls through to the per-batch finalization below.
 
-		for (i=startSegIx ; i<endSegIx ; i++)
+		if (parallel_ydrop_batch_size > 0)
+			{
+			u32             par_K  = parallel_ydrop_batch_size;
+			u32             par_nA = endSegIx - startSegIx;
+			typedef struct
+				{
+				u8     state;      // 0 = skip, 1 = no-alignment, 2 = ok
+				unspos orig_pos1;  // original anchor coords, kept for the
+				unspos orig_pos2;  // serial-commit in-batch containment recheck
+				} par_state_t;
+			par_state_t*    par_state;
+			int             par_paired_break = 0;
+			int             par_paired_discard = 0;
+			u32             par_bs, par_be, par_j;
+			#define ANCH_SKIP 0
+			#define ANCH_NOAL 1
+			#define ANCH_OK   2
+
+			par_state = zalloc_or_die ("par_state",
+			                           par_nA * sizeof (par_state[0]));
+			parallel_ydrop_anchors += par_nA;
+
+			for (par_bs = startSegIx;
+			     par_bs < endSegIx && !par_paired_break;
+			     par_bs += par_K)
+				{
+				par_be = par_bs + par_K;
+				if (par_be > endSegIx) par_be = endSegIx;
+				parallel_ydrop_batches++;
+
+				dbg_timing_gapped_extend_sub (debugClockYdropAlign);
+				#pragma omp parallel for schedule(dynamic, 1)
+				for (par_j = par_bs; par_j < par_be; par_j++)
+					{
+					galign*   par_mp = msp[par_j];
+					alignio   par_io = io;
+					partition *par_p1 = NULL, *par_p2 = NULL;
+					u32       par_rj = par_j - startSegIx;
+
+					par_io.anchor1 = par_mp->pos1;
+					par_io.anchor2 = par_mp->pos2;
+					par_io.hspId   = par_mp->hspId;
+					par_io.leftAlign  = par_io.rightAlign = NULL;
+					par_io.leftSeg    = par_io.rightSeg   = NULL;
+					par_io.aboveList  = par_io.belowList  = NULL;
+
+					par_state[par_rj].orig_pos1 = par_mp->pos1;
+					par_state[par_rj].orig_pos2 = par_mp->pos2;
+
+					#pragma omp atomic
+					alstats_total_anchors++;
+
+					if (!msp_left_right (orderBegInc, par_mp))
+						{
+						#pragma omp atomic
+						alstats_skipped_contained++;
+						par_state[par_rj].state = ANCH_SKIP;
+						continue;
+						}
+					#pragma omp atomic
+					alstats_ran_ydrop_align++;
+
+					if (segBatches->batch[batIx].part != NULL)
+						{
+						par_p1 = segBatches->batch[batIx].part;
+						par_io.low1  = par_p1->sepBefore + 1;
+						par_io.high1 = par_p1->sepAfter;
+						}
+					else if (sp1->p != NULL)
+						{
+						par_p1 = lookup_partition (seq1, par_io.anchor1);
+						par_io.low1  = par_p1->sepBefore + 1;
+						par_io.high1 = par_p1->sepAfter;
+						}
+					if (sp2->p != NULL)
+						{
+						par_p2 = lookup_partition (seq2, par_io.anchor2);
+						par_io.low2  = par_p2->sepBefore + 1;
+						par_io.high2 = par_p2->sepAfter;
+						}
+					(void) par_p1; (void) par_p2;
+
+					if (seq2->choresFile != NULL)
+						{
+						interval tInt = seq2->chore.targetInterval;
+						interval qInt = seq2->chore.queryInterval;
+						if (tInt.s > par_io.low1)  par_io.low1  = tInt.s;
+						if (tInt.e < par_io.high1) par_io.high1 = tInt.e;
+						if (qInt.s > par_io.low2)  par_io.low2  = qInt.s;
+						if (qInt.e < par_io.high2) par_io.high2 = qInt.e;
+						}
+
+					ydrop_align_sane (&par_io);
+
+					par_mp->align = format_alignment (&par_io, par_mp);
+					par_mp->pos1  = par_io.start1;
+					par_mp->pos2  = par_io.start2;
+					par_mp->end1  = par_io.stop1;
+					par_mp->end2  = par_io.stop2;
+
+					if (par_mp->firstSeg == NULL)
+						{
+						par_state[par_rj].state = ANCH_NOAL;
+						continue;
+						}
+					par_mp->lastSeg = par_mp->firstSeg->prevSeg;
+					par_mp->firstSeg->prevSeg = par_mp->lastSeg->nextSeg = NULL;
+					par_state[par_rj].state = ANCH_OK;
+					}
+				dbg_timing_gapped_extend_add (debugClockYdropAlign);
+
+				for (par_j = par_bs; par_j < par_be; par_j++)
+					{
+					u32 par_rj = par_j - startSegIx;
+					if (par_state[par_rj].state != ANCH_OK) continue;
+					mp = msp[par_j];
+
+					if ((!allBounds) && (mp->align->s < scoreThresh.s))
+						{
+						free_align_list (mp->align);
+						for (bp = mp->firstSeg; bp != NULL; bp = bq)
+							{
+							bq = bp->nextSeg;
+							free_if_valid ("gapped_extend seg", bp);
+							}
+						mp->firstSeg = NULL;
+						par_state[par_rj].state = ANCH_NOAL;
+						continue;
+						}
+
+					// In-batch containment recheck: an earlier anchor in
+					// this same batch may have produced an alignment that
+					// now contains this anchor. Re-run msp_left_right with
+					// the *original* anchor coords (saved above) against
+					// the current orderBegInc, which includes anchors
+					// already committed from this batch.
+					{
+					galign tmp = *mp;
+					tmp.pos1 = par_state[par_rj].orig_pos1;
+					tmp.pos2 = par_state[par_rj].orig_pos2;
+					if (!msp_left_right (orderBegInc, &tmp))
+						{
+						alstats_skipped_contained++;
+						alstats_ran_ydrop_align--;	// charge it back: this
+						                            // y-drop ran but is now
+						                            // suppressed in commit
+						free_align_list (mp->align);
+						for (bp = mp->firstSeg; bp != NULL; bp = bq)
+							{
+							bq = bp->nextSeg;
+							free_if_valid ("gapped_extend seg", bp);
+							}
+						mp->firstSeg = NULL;
+						par_state[par_rj].state = ANCH_NOAL;
+						continue;
+						}
+					}
+
+					dbg_timing_gapped_extend_sub (debugClockLeftRight);
+					align_left_right (orderBegInc, mp);
+					insert_align (mp, &orderBegInc, &orderEndDec);
+					dbg_timing_gapped_extend_add (debugClockLeftRight);
+
+					if (maxPairedBases > 0)
+						{
+						newPairedBases = count_paired_bases (mp);
+						pairedBases += newPairedBases;
+						if (pairedBases > maxPairedBases)
+							{
+							if (overlyPairedWarn)
+								warn_for_paired_bases_limit (seq2,
+								    maxPairedBases, overlyPairedKeep);
+							if (!overlyPairedKeep)
+								{ par_paired_discard = 1; par_paired_break = 1; break; }
+							par_paired_break = 1;
+							break;
+							}
+						}
+					}
+				}
+
+			free_if_valid ("par_state", par_state);
+			if (par_paired_discard)
+				goto discard_alignments;
+			}
+		else for (i=startSegIx ; i<endSegIx ; i++)
 			{
 			mp = msp[i];
 
@@ -2874,6 +3137,98 @@ static void ydrop_align
 #if ((defined(snoopAlignioOutput)) || (defined(snoopEditScripts)))
 	dump_alignio_output (stderr, io);
 #endif // snoopAlignioOutput OR snoopEditScripts
+	}
+
+//----------
+// ydrop_align_sane--
+//   Thread-safe equivalent of ydrop_align that uses
+//   ydrop_one_sided_align_impl_sane_double_buffered for both halves.
+//
+//   Has the same observable effect on io as ydrop_align (sets io->s,
+//   io->start1, io->start2, io->stop1, io->stop2, io->script), but is
+//   safe to call concurrently because the sane impl allocates all its
+//   scratch on the heap rather than reusing the module-static tback /
+//   dpMatrix buffers ydrop_one_sided_align relies on.
+//
+//   Assumes the caller has guaranteed the "v0 scope" the sane impl is
+//   validated against:
+//     - io->trimToPeak == true,
+//     - io->leftSeg == io->rightSeg == NULL,
+//     - io->leftAlign == io->rightAlign == NULL,
+//     - io->aboveList == io->belowList == NULL.
+//   The batched-parallel anchor loop (gate: LASTZ_PARALLEL_YDROP env
+//   var) is the only caller and forces these conditions by combining
+//   parallel mode with LASTZ_DISABLE_NEIGHBOR_MASK semantics.
+//----------
+
+static void ydrop_align_sane (alignio* io)
+	{
+	unspos      anchor1, anchor2;
+	unspos      end1, end2;
+	score       scoreLeft, scoreRight;
+	editscript* script;
+	editscript* scriptRight;
+	u32         op;
+
+	if (io == NULL)
+		suicide ("ydrop_align_sane() called with NULL pointer.");
+
+	anchor1 = io->anchor1;
+	anchor2 = io->anchor2;
+
+	// left half: extend reversed from the anchor toward seq starts
+
+	script = edit_script_new ();
+	scoreLeft = ydrop_one_sided_align_impl_sane_double_buffered (
+	                 io->rev1 + io->len1 - anchor1 - 2,
+	                 (anchor1 + 1) - io->low1,
+	                 io->rev2 + io->len2 - anchor2 - 2,
+	                 (anchor2 + 1) - io->low2,
+	                 io->scoring->sub,
+	                 io->scoring->gapOpen,
+	                 io->scoring->gapExtend,
+	                 io->yDrop,
+	                 &script, &end1, &end2);
+	io->start1 = anchor1 + 1 - end1;
+	io->start2 = anchor2 + 1 - end2;
+
+	// right half: extend forward from the anchor toward seq ends
+
+	scriptRight = edit_script_new ();
+	scoreRight = ydrop_one_sided_align_impl_sane_double_buffered (
+	                 io->seq1 + anchor1,
+	                 io->high1 - (anchor1 + 1),
+	                 io->seq2 + anchor2,
+	                 io->high2 - (anchor2 + 1),
+	                 io->scoring->sub,
+	                 io->scoring->gapOpen,
+	                 io->scoring->gapExtend,
+	                 io->yDrop,
+	                 &scriptRight, &end1, &end2);
+	io->stop1 = anchor1 + end1;
+	io->stop2 = anchor2 + end2;
+
+	// combine: reverse the right script and append to the left script
+
+	edit_script_reverse (scriptRight);
+	edit_script_append  (&script, scriptRight);
+	free_if_valid       ("ydrop_align_sane, edit script", scriptRight);
+
+	io->s      = scoreRight + scoreLeft;
+	io->script = script;
+
+	// trim leading/trailing indels, same as ydrop_align
+
+	if (io->script->len != 0)
+		{
+		op = edit_op_operation (io->script->op[0]);
+		if (op != editopSub)
+			lop_initial_indels (io);
+
+		op = edit_op_operation (io->script->op[io->script->len-1]);
+		if (op != editopSub)
+			lop_final_indels (io);
+		}
 	}
 
 

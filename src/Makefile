@@ -86,6 +86,11 @@ omp ?= 0
 ifeq ($(omp), ON)
 	OMP_CFLAGS  = -fopenmp
 	OMP_LDFLAGS = -fopenmp
+else
+	# Without -fopenmp, gcc treats #pragma omp directives as unknown
+	# pragmas; combined with -Werror that would fail the build. Suppress
+	# just that one warning so the omp=OFF build still compiles cleanly.
+	OMP_CFLAGS  = -Wno-unknown-pragmas
 endif
 
 
