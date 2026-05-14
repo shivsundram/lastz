@@ -1598,16 +1598,23 @@ alignel* gapped_extend
 		// into that order)
 		//
 		// If LASTZ_PARALLEL_YDROP is active, run the T1 batched parallel
-		// path: anchors in [startSegIx, endSegIx) are processed in chunks
-		// of parallel_ydrop_batch_size; within each chunk, y-drop runs in
-		// parallel via ydrop_align_sane, then a serial commit pass applies
-		// score-threshold filtering, align_left_right, and insert_align.
-		// The chunk's containment check sees the orderBegInc state
-		// committed by the previous chunk (stale-but-monotone). Output
-		// drifts slightly from the serial path because batch-stale
-		// containment lets a few extra anchors through; this is the same
-		// trade-off as the cross-anchor-dependency study's variant 2a.
-		// Falls through to the per-batch finalization below.
+		// path. Strategy: walk msp[] in score order *serially* doing the
+		// cheap containment check (msp_left_right is O(|orderBegInc|);
+		// ~17 ms total across a 17 982-anchor run); accumulate survivors
+		// into a `pending` buffer of size parallel_ydrop_batch_size; once
+		// the buffer fills, dispatch a #pragma omp parallel for that runs
+		// ydrop_align_sane on every pending anchor concurrently, then a
+		// serial commit pass walks the results in score order, applies
+		// score-threshold filtering, an in-batch containment recheck
+		// (against the live orderBegInc, since earlier survivors in this
+		// same batch may now shadow this one), align_left_right, and
+		// insert_align. Falls through to the per-batch finalization below.
+		//
+		// This design has no speculative work amplification: y-drop runs
+		// on exactly the same set of survivors the serial path would (plus
+		// the rare in-batch shadowed case, which the recheck rejects).
+		// Cross-anchor masking is forced off — see Experiment 2a in
+		// README §11 for the impact (bp-set Jaccard 0.9977 vs baseline).
 
 		if (parallel_ydrop_batch_size > 0)
 			{
@@ -1620,33 +1627,60 @@ alignel* gapped_extend
 				unspos orig_pos2;  // serial-commit in-batch containment recheck
 				} par_state_t;
 			par_state_t*    par_state;
+			u32*            par_pending;
+			u32             par_n_pending = 0;
+			u32             par_pi, par_j;
 			int             par_paired_break = 0;
 			int             par_paired_discard = 0;
-			u32             par_bs, par_be, par_j;
 			#define ANCH_SKIP 0
 			#define ANCH_NOAL 1
 			#define ANCH_OK   2
 
 			par_state = zalloc_or_die ("par_state",
 			                           par_nA * sizeof (par_state[0]));
+			par_pending = malloc_or_die ("par_pending",
+			                             par_K * sizeof (par_pending[0]));
 			parallel_ydrop_anchors += par_nA;
 
-			for (par_bs = startSegIx;
-			     par_bs < endSegIx && !par_paired_break;
-			     par_bs += par_K)
+			par_j = startSegIx;
+			while (par_j < endSegIx && !par_paired_break)
 				{
-				par_be = par_bs + par_K;
-				if (par_be > endSegIx) par_be = endSegIx;
+				// Phase 1: scan serially, fill pending[] with up to par_K
+				// survivors of the containment check. Each iteration is
+				// a cheap O(|orderBegInc|) walk.
+				par_n_pending = 0;
+				while (par_j < endSegIx && par_n_pending < par_K)
+					{
+					galign* par_mp = msp[par_j];
+					u32     par_rj = par_j - startSegIx;
+					alstats_total_anchors++;
+					if (!msp_left_right (orderBegInc, par_mp))
+						{
+						alstats_skipped_contained++;
+						par_state[par_rj].state = ANCH_SKIP;
+						par_j++;
+						continue;
+						}
+					alstats_ran_ydrop_align++;
+					par_state[par_rj].orig_pos1 = par_mp->pos1;
+					par_state[par_rj].orig_pos2 = par_mp->pos2;
+					par_pending[par_n_pending++] = par_j;
+					par_j++;
+					}
+
+				if (par_n_pending == 0) break;
 				parallel_ydrop_batches++;
 
+				// Phase 2: parallel y-drop on the pending survivors.
 				dbg_timing_gapped_extend_sub (debugClockYdropAlign);
 				#pragma omp parallel for schedule(dynamic, 1)
-				for (par_j = par_bs; par_j < par_be; par_j++)
+				for (par_pi = 0; par_pi < par_n_pending; par_pi++)
 					{
-					galign*   par_mp = msp[par_j];
+					u32       par_ji = par_pending[par_pi];
+					galign*   par_mp = msp[par_ji];
 					alignio   par_io = io;
 					partition *par_p1 = NULL, *par_p2 = NULL;
-					u32       par_rj = par_j - startSegIx;
+					u32       par_rj = par_ji - startSegIx;
 
 					par_io.anchor1 = par_mp->pos1;
 					par_io.anchor2 = par_mp->pos2;
@@ -1654,22 +1688,6 @@ alignel* gapped_extend
 					par_io.leftAlign  = par_io.rightAlign = NULL;
 					par_io.leftSeg    = par_io.rightSeg   = NULL;
 					par_io.aboveList  = par_io.belowList  = NULL;
-
-					par_state[par_rj].orig_pos1 = par_mp->pos1;
-					par_state[par_rj].orig_pos2 = par_mp->pos2;
-
-					#pragma omp atomic
-					alstats_total_anchors++;
-
-					if (!msp_left_right (orderBegInc, par_mp))
-						{
-						#pragma omp atomic
-						alstats_skipped_contained++;
-						par_state[par_rj].state = ANCH_SKIP;
-						continue;
-						}
-					#pragma omp atomic
-					alstats_ran_ydrop_align++;
 
 					if (segBatches->batch[batIx].part != NULL)
 						{
@@ -1720,11 +1738,13 @@ alignel* gapped_extend
 					}
 				dbg_timing_gapped_extend_add (debugClockYdropAlign);
 
-				for (par_j = par_bs; par_j < par_be; par_j++)
+				// Phase 3: serial commit in score order.
+				for (par_pi = 0; par_pi < par_n_pending; par_pi++)
 					{
-					u32 par_rj = par_j - startSegIx;
+					u32 par_ji = par_pending[par_pi];
+					u32 par_rj = par_ji - startSegIx;
 					if (par_state[par_rj].state != ANCH_OK) continue;
-					mp = msp[par_j];
+					mp = msp[par_ji];
 
 					if ((!allBounds) && (mp->align->s < scoreThresh.s))
 						{
@@ -1740,11 +1760,9 @@ alignel* gapped_extend
 						}
 
 					// In-batch containment recheck: an earlier anchor in
-					// this same batch may have produced an alignment that
+					// this same batch may have committed an alignment that
 					// now contains this anchor. Re-run msp_left_right with
-					// the *original* anchor coords (saved above) against
-					// the current orderBegInc, which includes anchors
-					// already committed from this batch.
+					// the *original* anchor coords (saved during Phase 1).
 					{
 					galign tmp = *mp;
 					tmp.pos1 = par_state[par_rj].orig_pos1;
@@ -1752,8 +1770,7 @@ alignel* gapped_extend
 					if (!msp_left_right (orderBegInc, &tmp))
 						{
 						alstats_skipped_contained++;
-						alstats_ran_ydrop_align--;	// charge it back: this
-						                            // y-drop ran but is now
+						alstats_ran_ydrop_align--;	// y-drop ran but is now
 						                            // suppressed in commit
 						free_align_list (mp->align);
 						for (bp = mp->firstSeg; bp != NULL; bp = bq)
@@ -1790,6 +1807,7 @@ alignel* gapped_extend
 					}
 				}
 
+			free_if_valid ("par_pending", par_pending);
 			free_if_valid ("par_state", par_state);
 			if (par_paired_discard)
 				goto discard_alignments;
