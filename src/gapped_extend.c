@@ -1721,6 +1721,33 @@ alignel* gapped_extend
 
 					ydrop_align_sane (&par_io);
 
+					// Mirror what lastz's native ydrop_one_sided_align does
+					// for the legacy "gapped extensions" / "anchors extended"
+					// counters: the native path increments numExtensions once
+					// per one-sided call (i.e. twice per anchor: left + right),
+					// and numAnchorsExtended once per anchor. ydrop_align_sane
+					// runs the impl twice itself, so we mirror "twice per
+					// anchor" here. atomic because we're inside the parallel
+					// for region. Guarded because the stats structs only exist
+					// under the corresponding build flags.
+					//
+					// Note: this counter reports "y-drop ran" semantics
+					// (Phase 2 count), which may be larger than the survivors
+					// reported as "ran ydrop_align" by the parallel-ydrop
+					// report (which subtracts Phase 3 in-batch suppression).
+					// (gapped_extensions / 2) - ran_ydrop_align = number of
+					// in-batch shadowed survivors.
+#ifdef collect_stats
+					#pragma omp atomic
+					gappedExtendStats.numExtensions += 2;
+					#pragma omp atomic
+					gappedExtendStats.numAnchorsExtended += 1;
+#endif
+#ifdef dbgTiming
+					#pragma omp atomic
+					gappedExtendTimingStats.numExtensions += 2;
+#endif
+
 					par_mp->align = format_alignment (&par_io, par_mp);
 					par_mp->pos1  = par_io.start1;
 					par_mp->pos2  = par_io.start2;
