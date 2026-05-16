@@ -639,3 +639,363 @@ score ydrop_one_sided_align_impl_sane_double_buffered (
 
     return bestScore;
     }
+
+
+//==========================================================================
+//
+// Pooled variant: per-thread reusable scratch
+//
+//   ydrop_scratch struct + ydrop_one_sided_align_impl_sane_double_buffered_pooled.
+//
+//   Bit-identical observable behavior to the per-call-malloc
+//   _double_buffered variant above, but with the eight per-call malloc/
+//   free pairs replaced by "grow buffer if too small, otherwise reuse".
+//   The first call sizes every buffer to its high-water mark; subsequent
+//   calls almost always hit the reuse path.
+//
+//   The lnkTape mid-call growth (when y-drop runs longer than expected)
+//   stays as realloc, but realloc's on the scratch's persistent pointer
+//   so the high-water mark survives across calls.
+//
+//==========================================================================
+
+struct ydrop_scratch {
+    // Sweep-row score buffers (4 × row_cells_cap entries each).
+    score  *C_prev;
+    score  *C_curr;
+    score  *D_prev;
+    score  *D_curr;
+    size_t  row_cells_cap;       // capacity of each of the 4 buffers, in cells
+
+    // Band-compact link tape (one byte per live DP cell).
+    u8     *lnkTape;
+    size_t  lnkTape_cap;         // capacity in bytes
+
+    // Per-row tape offsets (M+2 entries).
+    size_t *lnkRow;
+    size_t  lnkRow_cap;          // capacity in entries
+
+    // Per-row band bounds (M+1 entries each).
+    unspos *LY;
+    unspos *RY;
+    size_t  bounds_cap;          // capacity in entries
+};
+
+
+// Allocate an empty scratch (no buffers yet — they grow on first use).
+ydrop_scratch *ydrop_scratch_new (void)
+    {
+    ydrop_scratch *s = (ydrop_scratch*) malloc_or_die (
+        "ydrop_scratch", sizeof(ydrop_scratch));
+    s->C_prev = s->C_curr = s->D_prev = s->D_curr = NULL;
+    s->row_cells_cap = 0;
+    s->lnkTape       = NULL;
+    s->lnkTape_cap   = 0;
+    s->lnkRow        = NULL;
+    s->lnkRow_cap    = 0;
+    s->LY = s->RY    = NULL;
+    s->bounds_cap    = 0;
+    return s;
+    }
+
+
+void ydrop_scratch_free (ydrop_scratch *s)
+    {
+    if (s == NULL) return;
+    free_if_valid ("ydrop_scratch RY",      s->RY);
+    free_if_valid ("ydrop_scratch LY",      s->LY);
+    free_if_valid ("ydrop_scratch lnkRow",  s->lnkRow);
+    free_if_valid ("ydrop_scratch lnkTape", s->lnkTape);
+    free_if_valid ("ydrop_scratch D_curr",  s->D_curr);
+    free_if_valid ("ydrop_scratch D_prev",  s->D_prev);
+    free_if_valid ("ydrop_scratch C_curr",  s->C_curr);
+    free_if_valid ("ydrop_scratch C_prev",  s->C_prev);
+    free_if_valid ("ydrop_scratch", s);
+    }
+
+
+score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
+    const u8       *A,         unspos M,
+    const u8       *B,         unspos N,
+    scorerow       *allSub,
+    score           gapOpen,
+    score           gapExtend,
+    score           yDrop,
+    editscript    **script_out,
+    unspos         *end1_out,
+    unspos         *end2_out,
+    ydrop_scratch  *s)
+    {
+    score gapE  = gapExtend;
+    score gapOE = gapOpen + gapExtend;
+
+    if (M == 0 || N == 0)
+        { *end1_out = *end2_out = 0; return 0; }
+
+    score yDropTail = (gapE > 0 ? yDrop / gapE : 0) + 16;
+
+    // ---- Grow scratch buffers in-place if too small ----
+    size_t row_cells = (size_t)N + 1;
+    if (s->row_cells_cap < row_cells)
+        {
+        s->C_prev = (score*) realloc_or_die ("ydrop_pool C_prev",
+                                             s->C_prev, row_cells * sizeof(score));
+        s->C_curr = (score*) realloc_or_die ("ydrop_pool C_curr",
+                                             s->C_curr, row_cells * sizeof(score));
+        s->D_prev = (score*) realloc_or_die ("ydrop_pool D_prev",
+                                             s->D_prev, row_cells * sizeof(score));
+        s->D_curr = (score*) realloc_or_die ("ydrop_pool D_curr",
+                                             s->D_curr, row_cells * sizeof(score));
+        s->row_cells_cap = row_cells;
+        }
+
+    size_t bounds_n = (size_t)M + 1;
+    if (s->bounds_cap < bounds_n)
+        {
+        s->LY = (unspos*) realloc_or_die ("ydrop_pool LY",
+                                          s->LY, bounds_n * sizeof(unspos));
+        s->RY = (unspos*) realloc_or_die ("ydrop_pool RY",
+                                          s->RY, bounds_n * sizeof(unspos));
+        s->bounds_cap = bounds_n;
+        }
+
+    size_t lnkRow_n = (size_t)M + 2;
+    if (s->lnkRow_cap < lnkRow_n)
+        {
+        s->lnkRow = (size_t*) realloc_or_die ("ydrop_pool lnkRow",
+                                              s->lnkRow, lnkRow_n * sizeof(size_t));
+        s->lnkRow_cap = lnkRow_n;
+        }
+
+    if (s->lnkTape_cap < LNKTAPE_INITIAL)
+        {
+        s->lnkTape = (u8*) realloc_or_die ("ydrop_pool lnkTape",
+                                           s->lnkTape, LNKTAPE_INITIAL);
+        s->lnkTape_cap = LNKTAPE_INITIAL;
+        }
+
+    // Local aliases so the rest of the algorithm reads identically to
+    // the unpooled variant. The C_prev/C_curr/D_prev/D_curr pointers
+    // get *swapped* between rows, so we can't write back into s at the
+    // end — but the swap permutes them among the 4 slots, so all four
+    // pointers in s are still valid (just possibly in a different role).
+    // Setting s's pointers back at function exit fixes that.
+    score  *C_prev = s->C_prev;
+    score  *C_curr = s->C_curr;
+    score  *D_prev = s->D_prev;
+    score  *D_curr = s->D_curr;
+    u8     *lnkTape     = s->lnkTape;
+    size_t  lnkTapeSize = s->lnkTape_cap;
+    size_t *lnkRow      = s->lnkRow;
+    unspos *LY = s->LY;
+    unspos *RY = s->RY;
+    size_t  lnkPos = 0;
+
+    for (size_t k = 0; k < row_cells; k++)
+        { C_prev[k] = C_curr[k] = D_prev[k] = D_curr[k] = negInf; }
+
+    score  bestScore = 0;
+    unspos end1 = 0, end2 = 0;
+
+    // ---- Row 0: pure-insertion prefix until y-drop bites ----
+    LY[0]     = 0;
+    lnkRow[0] = lnkPos - (size_t)LY[0];
+
+    if (lnkPos + (size_t)N + 1 > lnkTapeSize)
+        {
+        size_t newSize = lnkTapeSize;
+        while (newSize < lnkPos + (size_t)N + 1) newSize *= LNKTAPE_GROWTH;
+        lnkTape = (u8*) realloc_or_die ("ydrop_pool lnkTape",
+                                        lnkTape, newSize);
+        lnkTapeSize = newSize;
+        }
+
+    C_prev[0]              = 0;
+    lnkTape[lnkRow[0] + 0] = 0;
+    lnkPos++;
+
+    unspos rowZeroStop = 1;
+    {
+    score prev_c = 0;
+    score next_c = -gapOE;
+    for (unspos col = 1; col <= N && prev_c >= -yDrop; col++)
+        {
+        C_prev[col]              = next_c;
+        lnkTape[lnkRow[0] + col] = cFromI;
+        lnkPos++;
+        rowZeroStop = col + 1;
+        prev_c      = next_c;
+        next_c     -= gapE;
+        }
+    }
+    RY[0] = rowZeroStop;
+
+    // ---- Main sweep: row-major ----
+    unspos r;
+    for (r = 1; r <= M; r++)
+        {
+        unspos initialLY = LY[r-1];
+        unspos rowRight  = RY[r-1];
+
+        size_t tbNeeded = (size_t)(rowRight - initialLY)
+                        + (size_t)yDropTail
+                        + 1;
+        if (lnkPos + tbNeeded > lnkTapeSize)
+            {
+            size_t newSize = lnkTapeSize;
+            while (newSize < lnkPos + tbNeeded) newSize *= LNKTAPE_GROWTH;
+            lnkTape = (u8*) realloc_or_die ("ydrop_pool lnkTape",
+                                            lnkTape, newSize);
+            lnkTapeSize = newSize;
+            }
+
+        LY[r]     = initialLY;
+        lnkRow[r] = lnkPos - (size_t)initialLY;
+
+        score *sub_row  = allSub[A[r]];
+        long   npCol    = (long)LY[r] - 1;
+        score  I_scalar = negInf;
+
+        for (unspos c = LY[r]; c < rowRight; c++)
+            {
+            score Drc = MAX (C_prev[c] - gapOE,
+                             D_prev[c] - gapE);
+
+            score Irc = (c == 0)
+                      ? negInf
+                      : MAX (C_curr[c-1] - gapOE,
+                             I_scalar  - gapE);
+
+            score diag = (c == 0)
+                       ? negInf
+                       : C_prev[c-1] + sub_row[B[c]];
+
+            score Crc;  u8 link;
+            int   pruned = 0;
+
+            if (Drc > diag || Irc > diag)
+                {
+                if (Drc >= Irc) { Crc = Drc; link = cFromD | iExtend | dExtend; }
+                else            { Crc = Irc; link = cFromI | iExtend | dExtend; }
+                if (Crc < bestScore - yDrop) pruned = 1;
+                }
+            else
+                {
+                Crc = diag;  link = cFromC;
+
+                if (Crc < bestScore - yDrop)
+                    pruned = 1;
+                else
+                    {
+                    if (Crc >= bestScore)
+                        { bestScore = Crc; end1 = r; end2 = c; }
+                    score cOpen = Crc - gapOE;
+                    if ((Drc - gapE) >= cOpen) link |= dExtend;
+                    if ((Irc - gapE) >= cOpen) link |= iExtend;
+                    }
+                }
+
+            if (pruned)
+                {
+                C_curr[c] = negInf;
+                D_curr[c] = negInf;
+                I_scalar  = negInf;
+                lnkTape[lnkRow[r] + c] = 0;
+                if (c == LY[r]) LY[r]++;
+                }
+            else
+                {
+                C_curr[c] = Crc;
+                D_curr[c] = Drc;
+                I_scalar  = Irc;
+                lnkTape[lnkRow[r] + c] = link;
+                npCol     = (long)c;
+                }
+
+            lnkPos++;
+            }
+
+        if ((long)rowRight > npCol + 1)
+            {
+            RY[r] = (unspos)(npCol + 1);
+            }
+        else
+            {
+            RY[r] = rowRight;
+            unspos col = rowRight;
+            if (col >= 1 && col <= N)
+                {
+                score i_next = MAX (C_curr[col-1] - gapOE,
+                                    I_scalar     - gapE);
+                while ((i_next >= bestScore - yDrop) && (col <= N))
+                    {
+                    C_curr[col]              = i_next;
+                    I_scalar                 = i_next;
+                    D_curr[col]              = i_next - gapOE;
+                    lnkTape[lnkRow[r] + col] = cFromI;
+                    lnkPos++;
+                    RY[r]                    = col + 1;
+                    col++;
+                    if (col > N) break;
+                    i_next -= gapE;
+                    }
+                }
+            }
+
+        if (RY[r] <= N)
+            {
+            RY[r]++;
+            C_curr[RY[r] - 1] = negInf;
+            D_curr[RY[r] - 1] = negInf;
+            }
+
+        if (LY[r] >= 1)
+            {
+            C_curr[LY[r] - 1] = negInf;
+            D_curr[LY[r] - 1] = negInf;
+            }
+
+        if (LY[r] >= RY[r]) break;
+
+        {
+        score *tmp;
+        tmp = C_prev; C_prev = C_curr; C_curr = tmp;
+        tmp = D_prev; D_prev = D_curr; D_curr = tmp;
+        }
+        }
+
+    // ---- Traceback ----
+    {
+    unspos row = end1, col = end2;
+    u8 prevOp = 0, op;
+    while (row >= 1 || col > 0)
+        {
+        u8 link = lnkTape[lnkRow[row] + col];
+        op = link & cidBits;
+        if ((prevOp == cFromI) && ((link & iExtend) != 0)) op = cFromI;
+        if ((prevOp == cFromD) && ((link & dExtend) != 0)) op = cFromD;
+
+        if      (op == cFromI) {           col--; edit_script_ins (script_out, 1); }
+        else if (op == cFromD) { row--;           edit_script_del (script_out, 1); }
+        else                   { row--;    col--; edit_script_sub (script_out, 1); }
+        prevOp = op;
+        }
+    }
+
+    *end1_out = end1;
+    *end2_out = end2;
+
+    // Persist any growth back into the scratch. The C/D pointers may
+    // have been swapped between rows above; the swap is a permutation,
+    // so writing them back here re-canonicalizes the four slots. The
+    // *content* of each slot is don't-care at this point — every call
+    // re-initializes its working buffers at entry.
+    s->C_prev      = C_prev;
+    s->C_curr      = C_curr;
+    s->D_prev      = D_prev;
+    s->D_curr      = D_curr;
+    s->lnkTape     = lnkTape;
+    s->lnkTape_cap = lnkTapeSize;
+
+    return bestScore;
+    }

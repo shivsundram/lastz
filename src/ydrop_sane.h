@@ -60,6 +60,44 @@ score ydrop_one_sided_align_impl_sane_double_buffered (
     unspos     *end1_out,
     unspos     *end2_out);
 
+//----------
+// Per-thread reusable scratch buffers for the pooled variant of the
+// double-buffered impl. Avoids the ~8 malloc/free pairs per call (× 2
+// halves per anchor × thousands of anchors) of the unpooled version.
+//
+// Lifecycle:
+//   - ydrop_scratch_new()    : allocate an empty scratch (no buffers yet).
+//   - ydrop_scratch_free()   : release all backing memory.
+//   - ydrop_one_sided_align_impl_sane_double_buffered_pooled() takes a
+//     scratch by reference and grows the buffers in-place as needed.
+//     Subsequent calls reuse what's already there; first call sizes
+//     everything once.
+//
+// Thread safety:
+//   Each ydrop_scratch is single-owner. Callers driving parallel y-drop
+//   must use one scratch per thread (e.g. an array indexed by
+//   omp_get_thread_num).
+//----------
+
+typedef struct ydrop_scratch ydrop_scratch;
+
+ydrop_scratch *ydrop_scratch_new  (void);
+void           ydrop_scratch_free (ydrop_scratch *s);
+
+// Identical observable behavior to ydrop_one_sided_align_impl_sane_double_buffered
+// but reuses the buffers in *scratch across calls. scratch must be non-NULL.
+score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
+    const u8       *A,         unspos M,
+    const u8       *B,         unspos N,
+    scorerow       *allSub,
+    score           gapOpen,
+    score           gapExtend,
+    score           yDrop,
+    editscript    **script_out,
+    unspos         *end1_out,
+    unspos         *end2_out,
+    ydrop_scratch  *scratch);
+
 #ifdef __cplusplus
 }
 #endif

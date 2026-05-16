@@ -71,6 +71,10 @@
 #include "gapped_extend.h"		// interface to this module
 #include "ydrop_sane.h"			// textbook ports for runtime A/B swap
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 //----------
 //
 // rdtsc-based substage instrumentation (build with -DdbgTimingSubstages).
@@ -265,6 +269,14 @@ static u32 parallel_ydrop_batch_size  = 0;
 static u64 parallel_ydrop_batches     = 0;
 static u64 parallel_ydrop_anchors     = 0;
 
+// Per-thread scratch pool for ydrop_align_sane. Allocated lazily on
+// first parallel batch (when omp_get_max_threads() is reliable),
+// indexed by omp_get_thread_num(). NULL entries are filled in on
+// first use by the owning thread. Disabled if LASTZ_YDROP_POOL=0.
+static ydrop_scratch **parallel_ydrop_scratches      = NULL;
+static int             parallel_ydrop_scratch_slots  = 0;
+static int             parallel_ydrop_pool_enabled   = -1; // -1 = unread
+
 static void parallel_ydrop_init (void)
 	{
 	if (parallel_ydrop_initialized >= 0) return;
@@ -280,6 +292,36 @@ static void parallel_ydrop_init (void)
 		         parallel_ydrop_batch_size);
 		}
 	parallel_ydrop_initialized = (parallel_ydrop_batch_size > 0);
+
+	// LASTZ_YDROP_POOL: per-thread reusable scratch for the sane impl.
+	// Default ON; set =0 to fall back to per-call malloc (A/B-able).
+	const char *p = getenv ("LASTZ_YDROP_POOL");
+	if (p != NULL && (p[0] == '0' || (p[0] == 'O' && p[1] == 'F')))
+		parallel_ydrop_pool_enabled = 0;
+	else
+		parallel_ydrop_pool_enabled = 1;
+
+	if (parallel_ydrop_batch_size > 0 && parallel_ydrop_pool_enabled == 0)
+		fprintf (stderr,
+		         "[lastz] LASTZ_YDROP_POOL=0: per-thread scratch pool disabled,"
+		         " falling back to per-call malloc\n");
+	}
+
+// Lazy-allocate the per-thread scratch array. Called once from
+// single-threaded code before entering the parallel region. Idempotent.
+static void parallel_ydrop_ensure_scratch_array (void)
+	{
+	if (parallel_ydrop_scratches != NULL) return;
+	if (!parallel_ydrop_pool_enabled) return;
+#ifdef _OPENMP
+	int n = omp_get_max_threads();
+#else
+	int n = 1;
+#endif
+	if (n < 1) n = 1;
+	parallel_ydrop_scratch_slots = n;
+	parallel_ydrop_scratches = (ydrop_scratch**) zalloc_or_die (
+	    "parallel_ydrop_scratches", (size_t)n * sizeof(ydrop_scratch*));
 	}
 
 void gapped_extend_parallel_ydrop_report (FILE *f)
@@ -689,7 +731,7 @@ static score    score_identical_partition_of
                                     partition* p1,
                                     scoreset* scoring);
 static void     ydrop_align        (alignio* io);
-static void     ydrop_align_sane   (alignio* io);
+static void     ydrop_align_sane   (alignio* io, ydrop_scratch* scratch);
 static score    ydrop_one_sided_align (alignio* io, int reversed,
                                     u8* A, u8* B, unspos M, unspos N,
                                     int trimToPeak,
@@ -1671,6 +1713,10 @@ alignel* gapped_extend
 				if (par_n_pending == 0) break;
 				parallel_ydrop_batches++;
 
+				// Allocate per-thread scratch array on first batch.
+				// Safe to call from single-threaded code; idempotent.
+				parallel_ydrop_ensure_scratch_array ();
+
 				// Phase 2: parallel y-drop on the pending survivors.
 				dbg_timing_gapped_extend_sub (debugClockYdropAlign);
 				#pragma omp parallel for schedule(dynamic, 1)
@@ -1719,7 +1765,28 @@ alignel* gapped_extend
 						if (qInt.e < par_io.high2) par_io.high2 = qInt.e;
 						}
 
-					ydrop_align_sane (&par_io);
+					// Per-thread scratch pool: each thread lazily creates its
+					// own scratch on first use (no locks; only the owning
+					// thread touches its slot).
+					ydrop_scratch* par_scratch = NULL;
+					if (parallel_ydrop_scratches != NULL)
+						{
+#ifdef _OPENMP
+						int par_tid = omp_get_thread_num();
+#else
+						int par_tid = 0;
+#endif
+						if (par_tid < parallel_ydrop_scratch_slots)
+							{
+							par_scratch = parallel_ydrop_scratches[par_tid];
+							if (par_scratch == NULL)
+								{
+								par_scratch = ydrop_scratch_new ();
+								parallel_ydrop_scratches[par_tid] = par_scratch;
+								}
+							}
+						}
+					ydrop_align_sane (&par_io, par_scratch);
 
 					// Mirror what lastz's native ydrop_one_sided_align does
 					// for the legacy "gapped extensions" / "anchors extended"
@@ -3206,7 +3273,7 @@ static void ydrop_align
 //   parallel mode with LASTZ_DISABLE_NEIGHBOR_MASK semantics.
 //----------
 
-static void ydrop_align_sane (alignio* io)
+static void ydrop_align_sane (alignio* io, ydrop_scratch* scratch)
 	{
 	unspos      anchor1, anchor2;
 	unspos      end1, end2;
@@ -3221,35 +3288,63 @@ static void ydrop_align_sane (alignio* io)
 	anchor1 = io->anchor1;
 	anchor2 = io->anchor2;
 
-	// left half: extend reversed from the anchor toward seq starts
+	// left half: extend reversed from the anchor toward seq starts.
+	// If scratch is non-NULL, use the pooled variant (per-thread reusable
+	// buffers). Otherwise fall back to per-call malloc.
 
 	script = edit_script_new ();
-	scoreLeft = ydrop_one_sided_align_impl_sane_double_buffered (
-	                 io->rev1 + io->len1 - anchor1 - 2,
-	                 (anchor1 + 1) - io->low1,
-	                 io->rev2 + io->len2 - anchor2 - 2,
-	                 (anchor2 + 1) - io->low2,
-	                 io->scoring->sub,
-	                 io->scoring->gapOpen,
-	                 io->scoring->gapExtend,
-	                 io->yDrop,
-	                 &script, &end1, &end2);
+	if (scratch != NULL)
+		scoreLeft = ydrop_one_sided_align_impl_sane_double_buffered_pooled (
+		                 io->rev1 + io->len1 - anchor1 - 2,
+		                 (anchor1 + 1) - io->low1,
+		                 io->rev2 + io->len2 - anchor2 - 2,
+		                 (anchor2 + 1) - io->low2,
+		                 io->scoring->sub,
+		                 io->scoring->gapOpen,
+		                 io->scoring->gapExtend,
+		                 io->yDrop,
+		                 &script, &end1, &end2,
+		                 scratch);
+	else
+		scoreLeft = ydrop_one_sided_align_impl_sane_double_buffered (
+		                 io->rev1 + io->len1 - anchor1 - 2,
+		                 (anchor1 + 1) - io->low1,
+		                 io->rev2 + io->len2 - anchor2 - 2,
+		                 (anchor2 + 1) - io->low2,
+		                 io->scoring->sub,
+		                 io->scoring->gapOpen,
+		                 io->scoring->gapExtend,
+		                 io->yDrop,
+		                 &script, &end1, &end2);
 	io->start1 = anchor1 + 1 - end1;
 	io->start2 = anchor2 + 1 - end2;
 
 	// right half: extend forward from the anchor toward seq ends
 
 	scriptRight = edit_script_new ();
-	scoreRight = ydrop_one_sided_align_impl_sane_double_buffered (
-	                 io->seq1 + anchor1,
-	                 io->high1 - (anchor1 + 1),
-	                 io->seq2 + anchor2,
-	                 io->high2 - (anchor2 + 1),
-	                 io->scoring->sub,
-	                 io->scoring->gapOpen,
-	                 io->scoring->gapExtend,
-	                 io->yDrop,
-	                 &scriptRight, &end1, &end2);
+	if (scratch != NULL)
+		scoreRight = ydrop_one_sided_align_impl_sane_double_buffered_pooled (
+		                 io->seq1 + anchor1,
+		                 io->high1 - (anchor1 + 1),
+		                 io->seq2 + anchor2,
+		                 io->high2 - (anchor2 + 1),
+		                 io->scoring->sub,
+		                 io->scoring->gapOpen,
+		                 io->scoring->gapExtend,
+		                 io->yDrop,
+		                 &scriptRight, &end1, &end2,
+		                 scratch);
+	else
+		scoreRight = ydrop_one_sided_align_impl_sane_double_buffered (
+		                 io->seq1 + anchor1,
+		                 io->high1 - (anchor1 + 1),
+		                 io->seq2 + anchor2,
+		                 io->high2 - (anchor2 + 1),
+		                 io->scoring->sub,
+		                 io->scoring->gapOpen,
+		                 io->scoring->gapExtend,
+		                 io->yDrop,
+		                 &scriptRight, &end1, &end2);
 	io->stop1 = anchor1 + end1;
 	io->stop2 = anchor2 + end2;
 
