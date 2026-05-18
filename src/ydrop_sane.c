@@ -50,7 +50,9 @@
 //
 //----------
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "build_options.h"
@@ -377,6 +379,46 @@ score ydrop_one_sided_align_impl_sane (
 // Initial size for the link tape and growth factor on overflow.
 #define LNKTAPE_INITIAL  (64u * 1024u)
 #define LNKTAPE_GROWTH   2u
+
+//----------
+// Per-call shape profiler — opt-in via LASTZ_YDROP_DUMP=<file>.
+//
+// When the env var is set, the pooled variant writes one TSV line per call
+// recording the DP shape we actually traversed:
+//
+//   M             input row bound (max remaining bp in sequence A)
+//   N             input col bound (max remaining bp in sequence B)
+//   end1, end2    location (row,col) of bestScore
+//   rows_run      rows actually iterated before the band collapsed
+//   live_cells    total cells with score writes (lnkPos at end of call)
+//   max_band      widest live band (max RY[r]-LY[r] over all rows)
+//   last_row_band band width on the last row before collapse
+//
+// Off by default; no overhead when the env var is unset (fopen is probed
+// once on first call and the FILE* cached).
+//
+// Used for sizing GPU kernel tiles and characterizing workload tails.
+// See README.md "Workload shape on the 1Mbp slice" for sample output.
+//----------
+static FILE *ydrop_dump_fp     = NULL;
+static int   ydrop_dump_probed = 0;
+
+static FILE *ydrop_dump_get (void)
+    {
+    if (!ydrop_dump_probed)
+        {
+        ydrop_dump_probed = 1;
+        const char *path = getenv ("LASTZ_YDROP_DUMP");
+        if (path != NULL && *path != 0)
+            {
+            ydrop_dump_fp = fopen (path, "w");
+            if (ydrop_dump_fp != NULL)
+                fprintf (ydrop_dump_fp,
+                    "M\tN\tend1\tend2\trows_run\tlive_cells\tmax_band\tlast_row_band\n");
+            }
+        }
+    return ydrop_dump_fp;
+    }
 
 score ydrop_one_sided_align_impl_sane_double_buffered (
     const u8   *A,         unspos M,
@@ -797,6 +839,10 @@ score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
     score  bestScore = 0;
     unspos end1 = 0, end2 = 0;
 
+    // Per-call shape tracking (cheap; only writes a line at end of call).
+    uint64_t prof_max_band = 0;
+    uint64_t prof_last_band = 0;
+
     // ---- Row 0: pure-insertion prefix until y-drop bites ----
     LY[0]     = 0;
     lnkRow[0] = lnkPos - (size_t)LY[0];
@@ -829,6 +875,8 @@ score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
         }
     }
     RY[0] = rowZeroStop;
+    prof_max_band = (uint64_t)(RY[0] - LY[0]);
+    prof_last_band = prof_max_band;
 
     // ---- Main sweep: row-major ----
     unspos r;
@@ -955,6 +1003,9 @@ score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
             D_curr[LY[r] - 1] = negInf;
             }
 
+        prof_last_band = (RY[r] > LY[r]) ? (uint64_t)(RY[r] - LY[r]) : 0;
+        if (prof_last_band > prof_max_band) prof_max_band = prof_last_band;
+
         if (LY[r] >= RY[r]) break;
 
         {
@@ -963,6 +1014,21 @@ score ydrop_one_sided_align_impl_sane_double_buffered_pooled (
         tmp = D_prev; D_prev = D_curr; D_curr = tmp;
         }
         }
+
+    {
+    FILE *dump = ydrop_dump_get();
+    if (dump != NULL)
+        {
+        unspos rows_run = (r <= M) ? r : M;
+        fprintf (dump,
+            "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+            (unsigned long long)M,        (unsigned long long)N,
+            (unsigned long long)end1,     (unsigned long long)end2,
+            (unsigned long long)rows_run, (unsigned long long)lnkPos,
+            (unsigned long long)prof_max_band,
+            (unsigned long long)prof_last_band);
+        }
+    }
 
     // ---- Traceback ----
     {
